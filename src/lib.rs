@@ -1,7 +1,11 @@
+use ahash::AHasher;
 use std::cell::{Ref, RefCell, RefMut};
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::hash::Hasher;
 use std::rc::{Rc, Weak};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 #[derive(Debug)]
 struct ListNode<K, T> {
@@ -175,6 +179,129 @@ where
         self.push_node_to_head(node_weak_ref);
 
         res
+    }
+}
+#[allow(unused)]
+struct ThreadSafeLruCache<K, T> {
+    handle: Arc<Mutex<LruCache<K, T>>>,
+}
+
+#[allow(unused)]
+impl<K, T> ThreadSafeLruCache<K, T>
+where
+    K: Hash + Eq + Clone,
+    T: Clone,
+{
+    fn with_capacity(cap: usize) -> ThreadSafeLruCache<K, T> {
+        let cache: LruCache<K, T> = LruCache::with_capacity(cap);
+        let cache_mutex = Mutex::new(cache);
+        let handle = Arc::new(cache_mutex);
+        ThreadSafeLruCache { handle }
+    }
+
+    async fn insert(&mut self, key: K, value: T) {
+        let mut guard = self.handle.lock().await;
+        guard.insert(key, value)
+    }
+
+    async fn get(&mut self, key: &K) -> Option<T> {
+        let mut guard = self.handle.lock().await;
+        let value = guard.get(key);
+        drop(guard);
+        value
+    }
+
+    async fn contains(&self, key: &K) -> bool {
+        let guard = self.handle.lock().await;
+        guard.contains(key)
+    }
+}
+
+pub struct RwLruCache<K, T> {
+    inner: InnerCacheShards<K, T>,
+}
+
+impl<K, T> RwLruCache<K, T>
+where
+    K: Hash + Eq + Clone,
+    T: Clone,
+{
+    pub fn new(cap: u64) -> RwLruCache<K, T> {
+        let inner = InnerCacheShards::new(cap);
+
+        RwLruCache { inner }
+    }
+
+    pub async fn get(&mut self, key: &K) -> Option<T> {
+        self.inner.get(key).await
+    }
+
+    pub async fn insert(&mut self, key: K, value: T) {
+        self.inner.insert(key, value).await;
+    }
+
+    pub async fn contains(&self, key: &K) -> bool {
+        self.inner.contains(key).await
+    }
+}
+
+struct InnerCacheShards<K, T> {
+    cache_shards: Box<[ThreadSafeLruCache<K, T>]>,
+    num_shards: u64,
+}
+
+impl<K, T> InnerCacheShards<K, T>
+where
+    K: Hash + Eq + Clone,
+    T: Clone,
+{
+    fn new(cap: u64) -> InnerCacheShards<K, T> {
+        let num_shards = num_cpus::get();
+        let mut shards_vec: Vec<ThreadSafeLruCache<K, T>> = Vec::with_capacity(num_shards);
+
+        let shard_size = (cap as f32 / num_shards as f32).ceil();
+
+        for _ in 0..num_shards {
+            let shard: ThreadSafeLruCache<K, T> =
+                ThreadSafeLruCache::with_capacity(shard_size as usize);
+            shards_vec.push(shard);
+        }
+
+        let cache_shards = shards_vec.into_boxed_slice();
+
+        InnerCacheShards {
+            cache_shards,
+            num_shards: num_shards as u64,
+        }
+    }
+
+    pub async fn get(&mut self, key: &K) -> Option<T> {
+        let mut hasher = AHasher::default();
+        key.hash(&mut hasher);
+        let hash_value = hasher.finish();
+        let shard_key = hash_value % self.num_shards;
+
+        let shard_cache = &mut self.cache_shards[shard_key as usize];
+        let value = shard_cache.get(key).await;
+        value
+    }
+
+    pub async fn insert(&mut self, key: K, value: T) {
+        let mut hasher = AHasher::default();
+        key.hash(&mut hasher);
+        let hash_value = hasher.finish();
+        let shard_key = hash_value % self.num_shards;
+        let shard_cache = &mut self.cache_shards[shard_key as usize];
+        shard_cache.insert(key, value).await;
+    }
+
+    pub async fn contains(&self, key: &K) -> bool {
+        let mut hasher = AHasher::default();
+        key.hash(&mut hasher);
+        let hash_value = hasher.finish();
+        let shard_key = hash_value % self.num_shards;
+        let shard_cache = &self.cache_shards[shard_key as usize];
+        shard_cache.contains(key).await
     }
 }
 
