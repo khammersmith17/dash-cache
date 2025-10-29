@@ -199,12 +199,12 @@ where
         ThreadSafeLruCache { handle }
     }
 
-    async fn insert(&mut self, key: K, value: T) {
+    async fn insert(&self, key: K, value: T) {
         let mut guard = self.handle.lock().await;
         guard.insert(key, value)
     }
 
-    async fn get(&mut self, key: &K) -> Option<T> {
+    async fn get(&self, key: &K) -> Option<T> {
         let mut guard = self.handle.lock().await;
         let value = guard.get(key);
         drop(guard);
@@ -212,7 +212,7 @@ where
     }
 
     async fn contains(&self, key: &K) -> bool {
-        let guard = self.handle.lock().await;
+        let mut guard = self.handle.lock().await;
         guard.contains(key)
     }
 }
@@ -232,11 +232,11 @@ where
         RwLruCache { inner }
     }
 
-    pub async fn get(&mut self, key: &K) -> Option<T> {
+    pub async fn get(&self, key: &K) -> Option<T> {
         self.inner.get(key).await
     }
 
-    pub async fn insert(&mut self, key: K, value: T) {
+    pub async fn insert(&self, key: K, value: T) {
         self.inner.insert(key, value).await;
     }
 
@@ -275,27 +275,27 @@ where
         }
     }
 
-    pub async fn get(&mut self, key: &K) -> Option<T> {
+    async fn get(&self, key: &K) -> Option<T> {
         let mut hasher = AHasher::default();
         key.hash(&mut hasher);
         let hash_value = hasher.finish();
         let shard_key = hash_value % self.num_shards;
 
-        let shard_cache = &mut self.cache_shards[shard_key as usize];
+        let shard_cache = &self.cache_shards[shard_key as usize];
         let value = shard_cache.get(key).await;
         value
     }
 
-    pub async fn insert(&mut self, key: K, value: T) {
+    async fn insert(&self, key: K, value: T) {
         let mut hasher = AHasher::default();
         key.hash(&mut hasher);
         let hash_value = hasher.finish();
         let shard_key = hash_value % self.num_shards;
-        let shard_cache = &mut self.cache_shards[shard_key as usize];
+        let shard_cache = &self.cache_shards[shard_key as usize];
         shard_cache.insert(key, value).await;
     }
 
-    pub async fn contains(&self, key: &K) -> bool {
+    async fn contains(&self, key: &K) -> bool {
         let mut hasher = AHasher::default();
         key.hash(&mut hasher);
         let hash_value = hasher.finish();
