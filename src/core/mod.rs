@@ -17,12 +17,27 @@ pub enum CacheError {
     CorruptedCacheError,
 }
 
-#[derive(Default)]
-struct CacheStats {
+#[derive(Default, Debug)]
+pub(crate) struct CacheStats {
     hits: usize,
     misses: usize,
     evictions: usize,
 }
+
+impl CacheStats {
+    fn miss(&mut self) {
+        self.misses += 1;
+    }
+
+    fn hit(&mut self) {
+        self.hits += 1;
+    }
+
+    fn eviction(&mut self) {
+        self.evictions += 1
+    }
+}
+
 #[derive(Debug)]
 struct CacheEntry<K, T> {
     value: T,
@@ -41,6 +56,7 @@ pub struct LruCache<K, T> {
     node_map: HashMap<K, Rc<RefCell<CacheEntry<K, T>>>>,
     head: Option<Weak<RefCell<CacheEntry<K, T>>>>,
     tail: Option<Weak<RefCell<CacheEntry<K, T>>>>,
+    stats: CacheStats,
 }
 
 impl<K, T> LruCache<K, T>
@@ -57,6 +73,7 @@ where
             node_map,
             head: None,
             tail: None,
+            stats: CacheStats::default(),
         }
     }
 
@@ -80,10 +97,13 @@ where
         }
         let node_rc = {
             let Some(rc) = self.node_map.get(&key) else {
+                self.stats.miss();
                 return Err(CacheError::KeyNotExist);
             };
             rc.clone()
         };
+
+        self.stats.hit();
 
         if let Some(head_clone) = self.head.clone() {
             if let Some(head_rc) = head_clone.upgrade() {
@@ -224,6 +244,7 @@ where
 
     fn pop_tail(&mut self) {
         self.assert_invariants();
+        self.stats.eviction();
 
         let curr_tail_weak_ref = self.tail.clone().unwrap();
         let curr_tail_rc = curr_tail_weak_ref.upgrade().unwrap();
@@ -275,7 +296,14 @@ where
         if self.head.is_none() {
             return None;
         }
-        let node_rc = self.node_map.get(key)?.clone();
+        let node_rc = if let Some(src_node_rc) = self.node_map.get(key) {
+            src_node_rc.clone()
+        } else {
+            self.stats.miss();
+            return None;
+        };
+
+        self.stats.hit();
         let node_ref: RefMut<CacheEntry<K, T>> = node_rc.as_ref().borrow_mut();
         let value = node_ref.value.clone();
         let res = Some(value);
@@ -303,11 +331,12 @@ struct ShardCacheEntry<K, T> {
     prev: Option<NonNull<ShardCacheEntry<K, T>>>,
 }
 
-struct CacheShard<K, T> {
+pub(crate) struct CacheShard<K, T> {
     cap: usize,
     node_map: HashMap<K, Box<ShardCacheEntry<K, T>>>,
     head: Option<NonNull<ShardCacheEntry<K, T>>>,
     tail: Option<NonNull<ShardCacheEntry<K, T>>>,
+    stats: CacheStats,
 }
 
 impl<K, T> CacheShard<K, T>
@@ -325,6 +354,7 @@ where
             node_map,
             head: None,
             tail: None,
+            stats: CacheStats::default(),
         }
     }
 
@@ -348,14 +378,17 @@ where
         );
         let mut entry_ptr = {
             let Some(cache_entry) = self.node_map.get(key) else {
+                self.stats.miss();
                 return Err(CacheError::KeyNotExist);
             };
             let ptr = NonNull::from(cache_entry.as_ref());
             ptr
         };
+        self.stats.hit();
 
-        debug_assert!(self.head.is_some());
-        let curr_head: NonNull<ShardCacheEntry<K, T>> = self.head.unwrap();
+        let Some(curr_head) = self.head else {
+            return Err(CacheError::CorruptedCacheError);
+        };
 
         // only promote node when it is not current head
         if !curr_head.eq(&entry_ptr) {
@@ -371,6 +404,7 @@ where
     }
 
     // empty is defined as both head and tail are None and the internal node_map is empty
+    #[allow(unused)]
     fn is_empty(&self) -> bool {
         self.head.is_none() && self.tail.is_none() && self.node_map.len() == 0
     }
@@ -401,7 +435,6 @@ where
             }
 
             let ptr = NonNull::from(boxed_node.as_mut());
-
             self.push_node_to_head(ptr);
         }
     }
@@ -414,6 +447,7 @@ where
         self.node_map.clear();
     }
 
+    #[inline]
     fn unlink_node(&mut self, mut node: NonNull<ShardCacheEntry<K, T>>) {
         #[cfg(debug_assertions)]
         {
@@ -457,6 +491,7 @@ where
         }
     }
 
+    #[inline]
     fn push_node_to_head(&mut self, mut node: NonNull<ShardCacheEntry<K, T>>) {
         // this method assumes that a node is fully unlinked before being pushed to the head
         #[cfg(debug_assertions)]
@@ -501,6 +536,7 @@ where
         }
     }
 
+    #[inline]
     fn pop_tail(&mut self) {
         // method assumes that it is only called when the cache is at capacity, requiring an
         // eviction
@@ -560,11 +596,13 @@ where
 
         let entry_ptr = {
             let Some(entry_box) = self.node_map.get(key) else {
+                self.stats.miss();
                 return None;
             };
             let ptr = NonNull::from(entry_box.as_ref());
             ptr
         };
+        self.stats.hit();
 
         let head_ptr = self.head.unwrap();
 

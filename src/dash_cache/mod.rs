@@ -1,4 +1,4 @@
-use crate::core::{CacheError, LruCache};
+use crate::core::{CacheError, CacheShard};
 use ahash::AHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
@@ -6,12 +6,12 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-// wrap LruCache in RwLock for better type semantics
+// wrap CacheShard in RwLock for better type semantics
 struct LockedCache<K, T> {
-    handle: RwLock<LruCache<K, T>>,
+    handle: RwLock<CacheShard<K, T>>,
 }
 
-// wrapper methods around the LruCache shard internal to a shard
+// wrapper methods around the CacheShard shard internal to a shard
 // This level on the type abstraction contains all concurrency primitives present in the type
 impl<K, T> LockedCache<K, T>
 where
@@ -19,7 +19,7 @@ where
     T: Clone,
 {
     fn with_capacity(cap: usize) -> LockedCache<K, T> {
-        let cache: LruCache<K, T> = LruCache::with_capacity(cap);
+        let cache: CacheShard<K, T> = CacheShard::with_capacity(cap);
         let handle = RwLock::new(cache);
         LockedCache { handle }
     }
@@ -61,7 +61,7 @@ where
 
 ///This lru cache implementation is an omage to dashmap::DashMap.
 ///Interally keys are sharded base on key hash to minimize locking access across threads. Each internal shard cache
-///is an instance of the single threaded cache type, LruCache.
+///is an instance of the single threaded cache type, CacheShard.
 ///Each shard is wrapped in a tokio::RwLock.
 ///Most APIs are locking on each shard, aside from the contains method, which is read only access.
 ///All other APIs may mutate the cache shard, thus requiring locking mutable references.
