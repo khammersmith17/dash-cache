@@ -110,7 +110,7 @@ where
         self.inner.get(key).await
     }
 
-    /// Provides unchecked access to data in the cache
+    /// Provides unchecked access to data in the cache. Same semantics apply as get.
     pub async fn get_unchecked(&self, key: &K) -> T {
         self.inner.get_unchecked(key).await
     }
