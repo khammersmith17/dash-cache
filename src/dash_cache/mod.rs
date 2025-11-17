@@ -1,4 +1,4 @@
-use crate::core::{CacheError, CacheShard};
+use crate::core::{CacheError, CacheShard, CacheStats};
 use ahash::AHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
@@ -9,6 +9,20 @@ use tokio::sync::RwLock;
 // wrap CacheShard in RwLock for better type semantics
 struct LockedCache<K, T> {
     handle: RwLock<CacheShard<K, T>>,
+}
+
+unsafe impl<K, T> Send for LockedCache<K, T>
+where
+    K: Send + 'static,
+    T: Send + 'static,
+{
+}
+
+unsafe impl<K, T> Sync for LockedCache<K, T>
+where
+    K: Sync + 'static,
+    T: Sync + 'static,
+{
 }
 
 // wrapper methods around the CacheShard shard internal to a shard
@@ -32,6 +46,11 @@ where
     async fn drain(&self) {
         let mut guard = self.handle.write().await;
         guard.drain();
+    }
+
+    async fn statistics(&self) -> CacheStats {
+        let guard = self.handle.read().await;
+        guard.statistics()
     }
 
     async fn get(&self, key: &K) -> Option<T> {
@@ -61,7 +80,7 @@ where
 
 ///This lru cache implementation is an omage to dashmap::DashMap.
 ///Interally keys are sharded base on key hash to minimize locking access across threads. Each internal shard cache
-///is an instance of the single threaded cache type, CacheShard.
+///is an instance of a thread safe cache table.
 ///Each shard is wrapped in a tokio::RwLock.
 ///Most APIs are locking on each shard, aside from the contains method, which is read only access.
 ///All other APIs may mutate the cache shard, thus requiring locking mutable references.
@@ -77,9 +96,10 @@ where
     T: Clone,
 {
     /// Use default sharding logic. By default the shard count will be equal to the number of cpu
-    /// cores available on the machine. The capacity will make a best effort attempt to be equally shared across the default
-    /// shard count with the given capacity. When request capacity < cpu core count, each shard
-    /// will have capacity of size 1.
+    /// cores available on the machine. When request capacity < cpu core count, each shard
+    /// will have capacity of size 1. In the case where capacity is not evenly divided by the
+    /// number of cpu cores available, each shard capacity rounds up to the next unsigned integer
+    /// value.
     pub fn new(cap: u64) -> DashCache<K, T> {
         let inner = Arc::new(InnerCacheShards::new(cap));
 
@@ -131,6 +151,13 @@ where
         self.inner.contains(key).await
     }
 
+    /// Statistics are kept interally to the nature of cache hits, misses, and evictions. This
+    /// methods provides a snapshot aggregated across all shards. This method will acquire a read
+    /// lock on all shards, blocking any mutable access during the aggregation.
+    pub async fn statistics(&self) -> CacheStats {
+        self.inner.statistics().await
+    }
+
     /// This method will update the value for a key. For similar borrowing semantic limitations,
     /// there is no provided get_mut method. Thus, this is the most appropriate method to update a
     /// value that exists in the cache. This method will not write a new key on a cache miss for a
@@ -156,6 +183,20 @@ where
 struct InnerCacheShards<K, T> {
     cache_shards: Box<[LockedCache<K, T>]>,
     num_shards: NonZeroUsize,
+}
+
+unsafe impl<K, T> Send for InnerCacheShards<K, T>
+where
+    K: Send + 'static,
+    T: Send + 'static,
+{
+}
+
+unsafe impl<K, T> Sync for InnerCacheShards<K, T>
+where
+    K: Sync + 'static,
+    T: Sync + 'static,
+{
 }
 
 impl<K, T> InnerCacheShards<K, T>
@@ -211,8 +252,7 @@ where
     async fn get(&self, key: &K) -> Option<T> {
         let shard_key = self.compute_shard(key);
         let shard_cache = &self.cache_shards[shard_key];
-        let value = shard_cache.get(key).await;
-        value
+        shard_cache.get(key).await
     }
 
     async fn drain(&self) {
@@ -251,5 +291,16 @@ where
         let shard_key = self.compute_shard(&key);
         let shard_cache = &self.cache_shards[shard_key];
         shard_cache.get_unchecked(key).await
+    }
+
+    async fn statistics(&self) -> CacheStats {
+        let mut stats = CacheStats::default();
+
+        for shard in self.cache_shards.iter() {
+            let shard_stats = shard.statistics().await;
+            stats += shard_stats;
+        }
+
+        stats
     }
 }

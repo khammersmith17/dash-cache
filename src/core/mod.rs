@@ -17,11 +17,30 @@ pub enum CacheError {
     CorruptedCacheError,
 }
 
-#[derive(Default, Debug)]
-pub(crate) struct CacheStats {
+#[derive(Default, Debug, Clone)]
+pub struct CacheStats {
     hits: usize,
     misses: usize,
     evictions: usize,
+}
+
+impl std::ops::Add<CacheStats> for CacheStats {
+    type Output = Self;
+    fn add(self, other: Self) -> Self::Output {
+        CacheStats {
+            hits: self.hits + other.hits,
+            misses: self.misses + other.misses,
+            evictions: self.evictions + other.evictions,
+        }
+    }
+}
+
+impl std::ops::AddAssign<CacheStats> for CacheStats {
+    fn add_assign(&mut self, other: Self) {
+        self.hits += other.hits;
+        self.misses += other.misses;
+        self.evictions += other.evictions;
+    }
 }
 
 impl CacheStats {
@@ -75,6 +94,12 @@ where
             tail: None,
             stats: CacheStats::default(),
         }
+    }
+
+    /// Cache hits, misses, and evictions are stored internally. This method exposes a snapshot of
+    /// the current cache locality performance.
+    pub fn statistics(&self) -> CacheStats {
+        self.stats.clone()
     }
 
     /// Returns whether or not a key exists in the cache.
@@ -266,28 +291,6 @@ where
         self.node_map.remove(&key_to_pop);
     }
 
-    /// Get method without associated checks for key existance.
-    /// Will panic when value does not exist in the map.
-    pub fn get_unchecked(&mut self, key: &K) -> T {
-        self.assert_invariants();
-        let node_rc = self.node_map[key].clone();
-        let node_ref: RefMut<CacheEntry<K, T>> = node_rc.as_ref().borrow_mut();
-        let value = node_ref.value.clone();
-        let res = value;
-        drop(node_ref);
-
-        if let Some(head_clone) = self.head.clone() {
-            if let Some(head_rc) = head_clone.upgrade() {
-                if !Rc::ptr_eq(&head_rc, &node_rc) {
-                    self.unlink_node(Rc::clone(&node_rc));
-                    let node_weak_ref = Rc::downgrade(&node_rc);
-                    self.push_node_to_head(node_weak_ref);
-                }
-            }
-        }
-        res
-    }
-
     /// Fetch value from the cache for associated key.
     /// Key value pair will then be promoted to most recently used.
     /// When they Key does not exist in the cache, None will be returned.
@@ -323,6 +326,8 @@ where
     }
 }
 
+// internal cache table entry for safely sharing across threads
+// leveraging NonNull safe pointers rather than
 #[derive(Clone)]
 struct ShardCacheEntry<K, T> {
     key: K,
@@ -331,12 +336,26 @@ struct ShardCacheEntry<K, T> {
     prev: Option<NonNull<ShardCacheEntry<K, T>>>,
 }
 
+// per shard cache table
 pub(crate) struct CacheShard<K, T> {
     cap: usize,
     node_map: HashMap<K, Box<ShardCacheEntry<K, T>>>,
     head: Option<NonNull<ShardCacheEntry<K, T>>>,
     tail: Option<NonNull<ShardCacheEntry<K, T>>>,
     stats: CacheStats,
+}
+
+unsafe impl<K, T> Send for CacheShard<K, T>
+where
+    K: Send + 'static,
+    T: Send + 'static,
+{
+}
+unsafe impl<K, T> Sync for CacheShard<K, T>
+where
+    K: Sync + 'static,
+    T: Sync + 'static,
+{
 }
 
 impl<K, T> CacheShard<K, T>
@@ -559,31 +578,6 @@ where
         self.node_map.remove(&key);
     }
 
-    /// Get method without associated checks for key existance.
-    /// Will panic when value does not exist in the map.
-    pub fn get_unchecked(&mut self, key: &K) -> T {
-        #[cfg(debug_assertions)]
-        {
-            // if key is cache hit, head and tail must be Some
-            debug_assert!(self.head.is_some() && self.tail.is_some());
-        }
-
-        let entry_ref = &self.node_map[key];
-
-        let head_ptr = self.head.unwrap();
-        let entry_ptr = NonNull::from(entry_ref.as_ref());
-
-        if !head_ptr.eq(&entry_ptr) {
-            self.unlink_node(entry_ptr);
-            self.push_node_to_head(entry_ptr);
-        }
-
-        let entry_ref = &self.node_map[key];
-        let value = entry_ref.value.clone();
-
-        value
-    }
-
     /// Fetch value from the cache for associated key.
     /// Key value pair will then be promoted to most recently used.
     /// When they Key does not exist in the cache, None will be returned.
@@ -614,5 +608,9 @@ where
         let value = unsafe { entry_ptr.as_ref().value.clone() };
 
         Some(value)
+    }
+
+    pub fn statistics(&self) -> CacheStats {
+        self.stats.clone()
     }
 }
