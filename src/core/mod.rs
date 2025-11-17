@@ -447,13 +447,14 @@ where
                 next: None,
             };
 
-            let mut boxed_node = Box::new(node);
-            self.node_map.insert(key, boxed_node.clone());
             if self.is_full() {
                 self.pop_tail();
             }
 
+            let mut boxed_node = Box::new(node);
             let ptr = NonNull::from(boxed_node.as_mut());
+            self.node_map.insert(key, boxed_node);
+
             self.push_node_to_head(ptr);
         }
     }
@@ -612,5 +613,127 @@ where
 
     pub fn statistics(&self) -> CacheStats {
         self.stats.clone()
+    }
+}
+
+#[cfg(test)]
+mod test {
+
+    use super::*;
+    use std::collections::HashSet;
+
+    fn cache<K: Hash + Eq + Clone, T: Clone>(cap: usize) -> LruCache<K, T> {
+        LruCache::with_capacity(cap)
+    }
+
+    #[test]
+    fn constructs_empty() {
+        let c: LruCache<i32, i32> = cache(3);
+        assert_eq!(c.node_map.len(), 0);
+        assert!(c.head.is_none());
+        assert!(c.tail.is_none());
+    }
+
+    #[test]
+    fn insert_get_contains() {
+        let mut c = cache(3);
+        c.insert("a", 1);
+        c.insert("b", 2);
+        assert!(c.contains(&"a"));
+        assert!(c.contains(&"b"));
+        assert_eq!(c.get(&"a"), Some(1));
+        assert_eq!(c.get(&"b"), Some(2));
+        assert_eq!(c.node_map.len(), 2);
+        // anchors must exist when non-empty
+        assert!(c.head.is_some());
+        assert!(c.tail.is_some());
+    }
+
+    #[test]
+    fn get_promotes_to_head() {
+        let mut c = cache(3);
+        c.insert("a", 1); // MRU = a
+        c.insert("b", 2); // MRU = b, LRU = a
+        c.insert("c", 3); // MRU = c, LRU = a
+
+        // Access "a" → promote to head (MRU)
+        assert_eq!(c.get(&"a"), Some(1));
+
+        // Now eviction should remove the old LRU ("b")
+        c.insert("d", 4); // at cap=3, one eviction occurs
+
+        assert!(c.contains(&"a"));
+        assert!(c.contains(&"c"));
+        assert!(c.contains(&"d"));
+        assert!(!c.contains(&"b"));
+    }
+
+    #[test]
+    fn update_changes_value_and_promotes() {
+        let mut c = cache(2);
+        c.insert("x", 10); // MRU = x
+        c.insert("y", 20); // MRU = y, LRU = x
+
+        // Update x → value changes and x promoted to MRU
+        c.update(&"x", 11).unwrap();
+        assert_eq!(c.get(&"x"), Some(11));
+
+        // Insert z → evicts the current LRU (which should now be y)
+        c.insert("z", 30);
+        assert!(c.contains(&"x"));
+        assert!(c.contains(&"z"));
+        assert!(!c.contains(&"y"));
+    }
+
+    #[test]
+    fn eviction_order_at_capacity() {
+        let mut c = cache(2);
+        c.insert(1, "a"); // MRU=1
+        c.insert(2, "b"); // MRU=2, LRU=1
+
+        // Touch 1 so it becomes MRU
+        assert_eq!(c.get(&1), Some("a"));
+
+        // Insert 3 triggers eviction of LRU (now 2)
+        c.insert(3, "c");
+
+        assert!(c.contains(&1));
+        assert!(c.contains(&3));
+        assert!(!c.contains(&2));
+    }
+
+    #[test]
+    fn drain_empties_cache() {
+        let mut c = cache(3);
+        c.insert("a", 1);
+        c.insert("b", 2);
+        c.insert("c", 3);
+        c.drain();
+        assert_eq!(c.node_map.len(), 0);
+        assert!(c.head.is_none());
+        assert!(c.tail.is_none());
+        assert_eq!(c.get(&"a"), None);
+    }
+
+    #[test]
+    fn many_inserts_and_accesses_preserve_invariants() {
+        let mut c = cache(5);
+        for i in 0..10 {
+            c.insert(i, i * 10);
+            // anchors must be consistent whenever non-empty
+            assert_eq!(c.head.is_some(), c.tail.is_some());
+            assert!(c.node_map.len() <= 5);
+        }
+
+        // Touch a few entries to move them to MRU
+        for i in [7, 8, 9] {
+            assert_eq!(c.get(&i), Some(i * 10));
+            assert_eq!(c.head.is_some(), c.tail.is_some());
+        }
+
+        // All keys in map should be unique and <= capacity
+        let keys: HashSet<_> = c.node_map.keys().cloned().collect();
+        assert_eq!(keys.len(), c.node_map.len());
+        assert!(c.node_map.len() <= 5);
     }
 }

@@ -71,11 +71,6 @@ where
         let guard = self.handle.read().await;
         guard.contains(key)
     }
-
-    async fn get_unchecked(&self, key: &K) -> T {
-        let mut guard = self.handle.write().await;
-        guard.get_unchecked(key)
-    }
 }
 
 ///This lru cache implementation is an omage to dashmap::DashMap.
@@ -128,11 +123,6 @@ where
     /// Again, given the borrowing semantics, a clone of the value is returned.
     pub async fn get(&self, key: &K) -> Option<T> {
         self.inner.get(key).await
-    }
-
-    /// Provides unchecked access to data in the cache. Same semantics apply as get.
-    pub async fn get_unchecked(&self, key: &K) -> T {
-        self.inner.get_unchecked(key).await
     }
 
     /// Given there is not get_mut to acquire mutable access to the value stored at a key, this is
@@ -285,12 +275,6 @@ where
         let shard_cache = &self.cache_shards[shard_key];
         shard_cache.update(key, value).await?;
         Ok(())
-    }
-
-    async fn get_unchecked(&self, key: &K) -> T {
-        let shard_key = self.compute_shard(&key);
-        let shard_cache = &self.cache_shards[shard_key];
-        shard_cache.get_unchecked(key).await
     }
 
     async fn statistics(&self) -> CacheStats {
