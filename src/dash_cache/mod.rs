@@ -1,5 +1,6 @@
 use crate::core::{CacheError, CacheShard, CacheStats};
 use ahash::AHasher;
+use futures::stream::{self, StreamExt};
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::num::NonZeroUsize;
@@ -9,20 +10,6 @@ use tokio::sync::RwLock;
 // wrap CacheShard in RwLock for better type semantics
 struct LockedCache<K, T> {
     handle: RwLock<CacheShard<K, T>>,
-}
-
-unsafe impl<K, T> Send for LockedCache<K, T>
-where
-    K: Send + 'static,
-    T: Send + 'static,
-{
-}
-
-unsafe impl<K, T> Sync for LockedCache<K, T>
-where
-    K: Sync + 'static,
-    T: Sync + 'static,
-{
 }
 
 // wrapper methods around the CacheShard shard internal to a shard
@@ -36,6 +23,11 @@ where
         let cache: CacheShard<K, T> = CacheShard::with_capacity(cap);
         let handle = RwLock::new(cache);
         LockedCache { handle }
+    }
+
+    async fn len(&self) -> usize {
+        let guard = self.handle.read().await;
+        guard.len()
     }
 
     async fn insert(&self, key: K, value: T) {
@@ -56,14 +48,17 @@ where
     async fn get(&self, key: &K) -> Option<T> {
         let mut guard = self.handle.write().await;
         let value = guard.get(key);
-        drop(guard);
         value
+    }
+
+    async fn pop(&self, key: &K) -> Option<T> {
+        let mut guard = self.handle.write().await;
+        guard.pop(key)
     }
 
     async fn update(&self, key: &K, value: T) -> Result<(), CacheError> {
         let mut guard = self.handle.write().await;
         guard.update(key, value)?;
-        drop(guard);
         Ok(())
     }
 
@@ -78,6 +73,7 @@ where
 ///is an instance of a thread safe cache table.
 ///Each shard is wrapped in a tokio::RwLock.
 ///Most APIs are locking on each shard, aside from the contains method, which is read only access.
+///All other methods mutate cache stat and thus require exclusive access.
 ///All other APIs may mutate the cache shard, thus requiring locking mutable references.
 ///This type wraps all shared internally in an tokio::sync::Arc, so wrapping this type in Arc is
 ///not required by users.
@@ -87,8 +83,8 @@ pub struct DashCache<K, T> {
 
 impl<K, T> DashCache<K, T>
 where
-    K: Hash + Eq + Clone,
-    T: Clone,
+    K: Hash + Eq + Clone + Send + Sync + 'static,
+    T: Clone + Send + Sync + 'static,
 {
     /// Use default sharding logic. By default the shard count will be equal to the number of cpu
     /// cores available on the machine. When request capacity < cpu core count, each shard
@@ -136,7 +132,8 @@ where
     }
 
     /// This is the only pure read method, and thus will not fully lock the local shard on a cache
-    /// hit. This method also will not promote the keyed value on a cache hit.
+    /// hit. This method also will not promote the keyed value on a cache hit. This is the only
+    /// exposed API that does not require mutable access.
     pub async fn contains(&self, key: &K) -> bool {
         self.inner.contains(key).await
     }
@@ -146,6 +143,15 @@ where
     /// lock on all shards, blocking any mutable access during the aggregation.
     pub async fn statistics(&self) -> CacheStats {
         self.inner.statistics().await
+    }
+
+    /// Pop an entry from the cache.
+    pub async fn pop(&self, key: &K) -> Option<T> {
+        self.inner.pop(key).await
+    }
+
+    pub async fn len(&self) -> usize {
+        self.inner.len().await
     }
 
     /// This method will update the value for a key. For similar borrowing semantic limitations,
@@ -191,12 +197,12 @@ where
 
 impl<K, T> InnerCacheShards<K, T>
 where
-    K: Hash + Eq + Clone,
-    T: Clone,
+    K: Hash + Eq + Clone + Send + Sync + 'static,
+    T: Clone + Send + Sync + 'static,
 {
     fn new(cap: u64) -> InnerCacheShards<K, T> {
         if cap == 0 {
-            panic!("Capacity must be greater than zero");
+            panic!("reqeusted capacity must be greater than zero");
         }
         let cpu_count = num_cpus::get();
         let mut shards_vec: Vec<LockedCache<K, T>> = Vec::with_capacity(cpu_count);
@@ -224,12 +230,16 @@ where
         if num_shards == 0 || shard_capacity == 0 {
             panic!("num_chards and shard_capacity must non zero")
         }
-        let mut shards_vec: Vec<LockedCache<K, T>> = Vec::with_capacity(shard_capacity);
+        let mut shards_vec: Vec<LockedCache<K, T>> = Vec::with_capacity(num_shards);
 
         for _ in 0..num_shards {
             let shard: LockedCache<K, T> = LockedCache::with_capacity(shard_capacity);
             shards_vec.push(shard);
         }
+
+        // in the case that the vec is over allocated
+        // make the heap shard allocation more compact
+        shards_vec.shrink_to_fit();
         let cache_shards = shards_vec.into_boxed_slice();
         let num_shards = unsafe { NonZeroUsize::new_unchecked(num_shards) };
 
@@ -237,6 +247,18 @@ where
             cache_shards,
             num_shards,
         }
+    }
+
+    // TODO: revist this
+    async fn len(&self) -> usize {
+        let len_iter = self.cache_shards.iter().map(|s| s.len());
+        let mut len_stream = stream::iter(len_iter);
+        let mut len = 0_usize;
+        while let Some(l) = len_stream.next().await {
+            len += l.await
+        }
+
+        len
     }
 
     async fn get(&self, key: &K) -> Option<T> {
@@ -275,6 +297,12 @@ where
         let shard_cache = &self.cache_shards[shard_key];
         shard_cache.update(key, value).await?;
         Ok(())
+    }
+
+    async fn pop(&self, key: &K) -> Option<T> {
+        let shard_key = self.compute_shard(key);
+        let shard_cache = &self.cache_shards[shard_key];
+        shard_cache.pop(key).await
     }
 
     async fn statistics(&self) -> CacheStats {

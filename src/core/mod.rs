@@ -57,6 +57,11 @@ impl CacheStats {
     }
 }
 
+pub struct CacheItem<K, T> {
+    pub key: K,
+    pub value: T,
+}
+
 #[derive(Debug)]
 struct CacheEntry<K, T> {
     value: T,
@@ -80,8 +85,8 @@ pub struct LruCache<K, T> {
 
 impl<K, T> LruCache<K, T>
 where
-    K: Hash + Eq + Clone,
-    T: Clone,
+    K: Hash + Eq + Clone + std::fmt::Debug,
+    T: Clone + std::fmt::Debug,
 {
     /// Only provided constructor
     /// Will initialize an LruCache with the requested capacity
@@ -94,6 +99,39 @@ where
             tail: None,
             stats: CacheStats::default(),
         }
+    }
+
+    /// Returns the number of items currently in the cache.
+    pub fn len(&self) -> usize {
+        debug_assert_eq!(self.node_map.len(), self.linked_list_len());
+        self.node_map.len()
+    }
+
+    pub fn pop(&mut self, key: &K) -> Option<T> {
+        let Some(cache_entry) = self.node_map.remove(key) else {
+            return None;
+        };
+
+        self.unlink_node(&cache_entry);
+
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(
+                (self.head.is_some() && self.tail.is_some())
+                    || (self.head.is_none() && self.tail.is_none())
+            )
+        }
+
+        // node unlinked
+        // only strong ref is stored in map
+        // thus, strong count should be one and we can safely unwrap the Rc
+        debug_assert!(Rc::strong_count(&cache_entry) == 1);
+
+        let deref_entry = Rc::try_unwrap(cache_entry).unwrap();
+        let entry_inner = deref_entry.into_inner();
+        let CacheEntry { value, .. } = entry_inner;
+
+        Some(value)
     }
 
     /// Cache hits, misses, and evictions are stored internally. This method exposes a snapshot of
@@ -133,7 +171,7 @@ where
         if let Some(head_clone) = self.head.clone() {
             if let Some(head_rc) = head_clone.upgrade() {
                 if !Rc::ptr_eq(&head_rc, &node_rc) {
-                    self.unlink_node(Rc::clone(&node_rc));
+                    self.unlink_node(&node_rc);
                     let node_weak_ref = Rc::downgrade(&node_rc);
                     self.push_node_to_head(node_weak_ref);
                 }
@@ -145,12 +183,12 @@ where
     }
 
     // empty is defined as both head and tail are None and the internal node_map is empty
-    fn is_empty(&self) -> bool {
-        self.head.is_none() && self.tail.is_none() && self.node_map.len() == 0
+    pub fn is_empty(&self) -> bool {
+        self.head.is_none() && self.tail.is_none() && self.len() == 0
     }
 
-    fn is_full(&self) -> bool {
-        self.node_map.len() == self.cap
+    pub fn is_full(&self) -> bool {
+        self.len() == self.cap
     }
 
     /// Insert value into the cache.
@@ -198,7 +236,8 @@ where
         )
     }
 
-    fn unlink_node(&mut self, node: Rc<RefCell<CacheEntry<K, T>>>) {
+    #[inline]
+    fn unlink_node(&mut self, node: &Rc<RefCell<CacheEntry<K, T>>>) {
         self.assert_invariants();
         // if the list is empty, then no movement needs to happen
         if self.is_empty() {
@@ -206,36 +245,64 @@ where
         }
 
         // get weak reference to prev and next
-        // pull mutable reference from RefCell
-        // mutable reference to enfore poth list pointers are null after unlinking
+        // pull immutable reference from RefCell
+        // scope shared borrow
+        let (prev_weak, next_weak) = {
+            let node_ref = node.borrow();
+            (node_ref.prev.clone(), node_ref.next.clone())
+        };
+
+        // 4 variant cases
+        // prev, next
+        // Some, Some -> this node is somewhere in the middle of the list
+        // Some, None -> This node is the current tail
+        // None, Some -> this node is the current head
+        // None, None -> cache is of size 1, current node is both head and tail
+
+        match (&prev_weak, &next_weak) {
+            (Some(prev), Some(next)) => {
+                // node is in the middle of the list
+                debug_assert!(prev.strong_count() >= 1 && next.strong_count() >= 1);
+
+                // assertion validates that strong count >= 1, upgrade is safe
+                let prev_rc_opt = prev.upgrade();
+                let next_rc_opt = next.upgrade();
+                debug_assert!(prev_rc_opt.is_some() && next_rc_opt.is_some());
+
+                if let (Some(prev_rc), Some(next_rc)) = (prev_rc_opt, next_rc_opt) {
+                    prev_rc.borrow_mut().next = next_weak.clone();
+                    next_rc.borrow_mut().prev = prev_weak.clone();
+                }
+            }
+            (None, Some(next)) => {
+                // node is current head
+                debug_assert!(next.strong_count() >= 1);
+                let next_rc = next.upgrade().unwrap();
+                next_rc.borrow_mut().prev = None;
+                self.head = next_weak.clone();
+            }
+            (Some(prev), None) => {
+                // node is current tail
+                debug_assert!(prev.strong_count() >= 1);
+                let prev_rc = prev.upgrade().unwrap();
+                prev_rc.borrow_mut().next = None;
+                self.tail = prev_weak.clone();
+            }
+            (None, None) => {
+                // current node is both head and tail
+                // both list refs are none, no need to clear, thus can return
+                // no unlinking required
+                self.head = None;
+                self.tail = None;
+            }
+        }
+
         let mut node_ref = node.borrow_mut();
-        let prev_weak = node_ref.prev.clone();
-        let next_weak = node_ref.next.clone();
-
-        // set prev next to node next
-        if let Some(ref prev) = prev_weak {
-            if let Some(prev_rc) = prev.upgrade() {
-                let mut prev_ref = prev_rc.borrow_mut();
-                prev_ref.next = next_weak.clone();
-            }
-        } else {
-            self.head = next_weak.clone();
-        }
-
-        // set next prev to node prev
-        if let Some(ref next) = next_weak {
-            if let Some(next_rc) = next.upgrade() {
-                let mut next_ref = next_rc.borrow_mut();
-                next_ref.prev = prev_weak.clone();
-            }
-        } else {
-            self.tail = prev_weak.clone();
-        }
-
         node_ref.prev = None;
         node_ref.next = None;
     }
 
+    #[inline]
     fn push_node_to_head(&mut self, node: Weak<RefCell<CacheEntry<K, T>>>) {
         self.assert_invariants();
         // if the list is empty set the node to be the head and tail
@@ -267,6 +334,32 @@ where
         self.head = Some(node)
     }
 
+    #[cfg(debug_assertions)]
+    fn linked_list_len(&self) -> usize {
+        let mut len = 0_usize;
+        let mut curr = if let Some(ref head_weak) = self.head {
+            head_weak.upgrade()
+        } else {
+            return len;
+        };
+
+        while curr.is_some() {
+            len += 1;
+
+            let curr_inner = curr.clone().unwrap();
+            let curr_ref = curr_inner.borrow();
+
+            curr = if let Some(ref next) = curr_ref.next {
+                next.upgrade()
+            } else {
+                None
+            };
+        }
+
+        len
+    }
+
+    #[inline]
     fn pop_tail(&mut self) {
         self.assert_invariants();
         self.stats.eviction();
@@ -315,7 +408,7 @@ where
         if let Some(head_clone) = self.head.clone() {
             if let Some(head_rc) = head_clone.upgrade() {
                 if !Rc::ptr_eq(&head_rc, &node_rc) {
-                    self.unlink_node(Rc::clone(&node_rc));
+                    self.unlink_node(&node_rc);
                     let node_weak_ref = Rc::downgrade(&node_rc);
                     self.push_node_to_head(node_weak_ref);
                 }
@@ -366,6 +459,10 @@ where
     /// Only provided constructor
     /// Will initialize an LruCache with the requested capacity
     pub fn with_capacity(cap: usize) -> CacheShard<K, T> {
+        if cap == 0 {
+            panic!("capacity must be > 0");
+        }
+
         let node_map: HashMap<K, Box<ShardCacheEntry<K, T>>> = HashMap::with_capacity(cap);
 
         CacheShard {
@@ -381,6 +478,10 @@ where
     /// This method is not defined as a use, thus accessing this key will not promote the item.
     pub fn contains(&self, key: &K) -> bool {
         self.node_map.contains_key(key)
+    }
+
+    pub fn len(&self) -> usize {
+        self.node_map.len()
     }
 
     /// Update an item that exists in the cache.
@@ -422,13 +523,34 @@ where
         Ok(())
     }
 
-    // empty is defined as both head and tail are None and the internal node_map is empty
-    #[allow(unused)]
-    fn is_empty(&self) -> bool {
-        self.head.is_none() && self.tail.is_none() && self.node_map.len() == 0
+    pub fn pop(&mut self, key: &K) -> Option<T> {
+        let Some(mut cache_entry) = self.node_map.remove(key) else {
+            return None;
+        };
+
+        let cache_entry_ptr = NonNull::from(cache_entry.as_mut());
+
+        self.unlink_node(cache_entry_ptr);
+
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(
+                (self.head.is_some() && self.tail.is_some())
+                    || (self.head.is_none() && self.tail.is_none())
+            )
+        }
+
+        let ShardCacheEntry { value, .. } = *cache_entry;
+        Some(value)
     }
 
-    fn is_full(&self) -> bool {
+    // empty is defined as both head and tail are None and the internal node_map is empty
+    #[allow(unused)]
+    pub fn is_empty(&self) -> bool {
+        self.head.is_none() && self.tail.is_none() && self.len() == 0
+    }
+
+    pub fn is_full(&self) -> bool {
         self.node_map.len() == self.cap
     }
 
@@ -479,35 +601,50 @@ where
 
         let (prev_opt, next_opt) = unsafe {
             let curr = node.as_ref();
-            (curr.prev, curr.next)
+            (curr.prev.clone(), curr.next.clone())
         };
 
-        if let Some(mut prev) = prev_opt {
-            unsafe { prev.as_mut().next = next_opt }
-        } else {
-            self.head = next_opt
+        match (prev_opt, next_opt) {
+            (Some(mut prev), Some(mut next)) => {
+                // node is in the middle of the list
+                unsafe { prev.as_mut().next = next_opt }
+                unsafe { next.as_mut().prev = prev_opt }
+            }
+            (Some(mut prev), None) => {
+                // node is current the tail
+                unsafe { prev.as_mut().next = None }
+                self.tail = prev_opt
+            }
+            (None, Some(mut next)) => {
+                // node is current head
+                unsafe { next.as_mut().prev = None }
+                self.head = next_opt
+            }
+            (None, None) => {
+                // node is both head and tail
+                // no unlinking required
+                self.head = None;
+                self.tail = None;
+            }
         }
 
-        if let Some(mut next) = next_opt {
-            unsafe { next.as_mut().prev = prev_opt }
-        } else {
-            self.tail = prev_opt
-        }
+        /*
+                if let Some(mut prev) = prev_opt {
+                    unsafe { prev.as_mut().next = next_opt }
+                } else {
+                    self.head = next_opt
+                }
+
+                if let Some(mut next) = next_opt {
+                    unsafe { next.as_mut().prev = prev_opt }
+                } else {
+                    self.tail = prev_opt
+                }
+        */
 
         unsafe {
             node.as_mut().prev = None;
             node.as_mut().next = None;
-        }
-
-        #[cfg(debug_assertions)]
-        {
-            // validating that node is unlinked after op
-            let (prev, next) = unsafe {
-                let node_ref = node.as_ref();
-                (node_ref.prev, node_ref.next)
-            };
-
-            debug_assert!(prev.is_none() && next.is_none());
         }
     }
 
@@ -532,7 +669,7 @@ where
         }
 
         // if the list is non-empty, update the current head prev pointer to point to node
-        //      update node next to point to current head
+        // update node next to point to current head
         // if the list is empty set the node to be the head and tail
         if let Some(mut curr_head) = self.head {
             unsafe {
@@ -583,12 +720,6 @@ where
     /// Key value pair will then be promoted to most recently used.
     /// When they Key does not exist in the cache, None will be returned.
     pub fn get(&mut self, key: &K) -> Option<T> {
-        #[cfg(debug_assertions)]
-        {
-            // if key is cache hit, head and tail must be Some
-            debug_assert!(self.head.is_some() && self.tail.is_some());
-        }
-
         let entry_ptr = {
             let Some(entry_box) = self.node_map.get(key) else {
                 self.stats.miss();
@@ -597,6 +728,13 @@ where
             let ptr = NonNull::from(entry_box.as_ref());
             ptr
         };
+
+        #[cfg(debug_assertions)]
+        {
+            // if key is cache hit, head and tail must be Some
+            debug_assert!(self.head.is_some() && self.tail.is_some());
+        }
+
         self.stats.hit();
 
         let head_ptr = self.head.unwrap();
@@ -617,18 +755,14 @@ where
 }
 
 #[cfg(test)]
-mod test {
+mod single_threaded_test {
 
     use super::*;
     use std::collections::HashSet;
 
-    fn cache<K: Hash + Eq + Clone, T: Clone>(cap: usize) -> LruCache<K, T> {
-        LruCache::with_capacity(cap)
-    }
-
     #[test]
     fn constructs_empty() {
-        let c: LruCache<i32, i32> = cache(3);
+        let c: LruCache<i32, i32> = LruCache::with_capacity(3);
         assert_eq!(c.node_map.len(), 0);
         assert!(c.head.is_none());
         assert!(c.tail.is_none());
@@ -636,7 +770,7 @@ mod test {
 
     #[test]
     fn insert_get_contains() {
-        let mut c = cache(3);
+        let mut c = LruCache::with_capacity(3);
         c.insert("a", 1);
         c.insert("b", 2);
         assert!(c.contains(&"a"));
@@ -644,23 +778,20 @@ mod test {
         assert_eq!(c.get(&"a"), Some(1));
         assert_eq!(c.get(&"b"), Some(2));
         assert_eq!(c.node_map.len(), 2);
-        // anchors must exist when non-empty
         assert!(c.head.is_some());
         assert!(c.tail.is_some());
     }
 
     #[test]
     fn get_promotes_to_head() {
-        let mut c = cache(3);
-        c.insert("a", 1); // MRU = a
-        c.insert("b", 2); // MRU = b, LRU = a
-        c.insert("c", 3); // MRU = c, LRU = a
+        let mut c = LruCache::with_capacity(3);
+        c.insert("a", 1);
+        c.insert("b", 2);
+        c.insert("c", 3);
 
-        // Access "a" → promote to head (MRU)
         assert_eq!(c.get(&"a"), Some(1));
 
-        // Now eviction should remove the old LRU ("b")
-        c.insert("d", 4); // at cap=3, one eviction occurs
+        c.insert("d", 4);
 
         assert!(c.contains(&"a"));
         assert!(c.contains(&"c"));
@@ -670,15 +801,13 @@ mod test {
 
     #[test]
     fn update_changes_value_and_promotes() {
-        let mut c = cache(2);
-        c.insert("x", 10); // MRU = x
-        c.insert("y", 20); // MRU = y, LRU = x
+        let mut c = LruCache::with_capacity(2);
+        c.insert("x", 10);
+        c.insert("y", 20);
 
-        // Update x → value changes and x promoted to MRU
         c.update(&"x", 11).unwrap();
         assert_eq!(c.get(&"x"), Some(11));
 
-        // Insert z → evicts the current LRU (which should now be y)
         c.insert("z", 30);
         assert!(c.contains(&"x"));
         assert!(c.contains(&"z"));
@@ -687,14 +816,12 @@ mod test {
 
     #[test]
     fn eviction_order_at_capacity() {
-        let mut c = cache(2);
-        c.insert(1, "a"); // MRU=1
-        c.insert(2, "b"); // MRU=2, LRU=1
+        let mut c = LruCache::with_capacity(2);
+        c.insert(1, "a");
+        c.insert(2, "b");
 
-        // Touch 1 so it becomes MRU
         assert_eq!(c.get(&1), Some("a"));
 
-        // Insert 3 triggers eviction of LRU (now 2)
         c.insert(3, "c");
 
         assert!(c.contains(&1));
@@ -704,7 +831,7 @@ mod test {
 
     #[test]
     fn drain_empties_cache() {
-        let mut c = cache(3);
+        let mut c = LruCache::with_capacity(3);
         c.insert("a", 1);
         c.insert("b", 2);
         c.insert("c", 3);
@@ -717,23 +844,199 @@ mod test {
 
     #[test]
     fn many_inserts_and_accesses_preserve_invariants() {
-        let mut c = cache(5);
+        let mut c = LruCache::with_capacity(5);
         for i in 0..10 {
             c.insert(i, i * 10);
-            // anchors must be consistent whenever non-empty
             assert_eq!(c.head.is_some(), c.tail.is_some());
             assert!(c.node_map.len() <= 5);
         }
 
-        // Touch a few entries to move them to MRU
         for i in [7, 8, 9] {
             assert_eq!(c.get(&i), Some(i * 10));
             assert_eq!(c.head.is_some(), c.tail.is_some());
         }
 
-        // All keys in map should be unique and <= capacity
         let keys: HashSet<_> = c.node_map.keys().cloned().collect();
         assert_eq!(keys.len(), c.node_map.len());
         assert!(c.node_map.len() <= 5);
+    }
+
+    #[test]
+    fn len() {
+        let mut c = LruCache::with_capacity(3);
+        c.insert("a", 1);
+        c.insert("b", 2);
+        c.insert("c", 3);
+        assert_eq!(c.len(), 3)
+    }
+
+    #[test]
+    fn pop() {
+        let mut c = LruCache::with_capacity(3);
+        c.insert("a", 1);
+        c.insert("b", 2);
+        c.insert("c", 3);
+        assert_eq!(c.pop(&"a"), Some(1));
+        assert_eq!(c.pop(&"c"), Some(3));
+        assert_eq!(c.pop(&"a"), None);
+        assert_eq!(c.pop(&"b"), Some(2));
+        assert_eq!(c.len(), 0);
+    }
+
+    #[test]
+    fn full_and_empty() {
+        let mut c = LruCache::with_capacity(3);
+        c.insert("a", 1);
+        c.insert("b", 2);
+        c.insert("c", 3);
+        assert!(c.is_full());
+        assert_eq!(c.pop(&"a"), Some(1));
+        assert_eq!(c.pop(&"c"), Some(3));
+        assert_eq!(c.pop(&"a"), None);
+        assert_eq!(c.pop(&"b"), Some(2));
+        assert!(c.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod shard_cache_test {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn constructs_empty() {
+        let c: CacheShard<i32, i32> = CacheShard::with_capacity(3);
+        assert_eq!(c.node_map.len(), 0);
+        assert!(c.head.is_none());
+        assert!(c.tail.is_none());
+    }
+
+    #[test]
+    fn insert_get_contains() {
+        let mut c = CacheShard::with_capacity(3);
+        c.insert("a", 1);
+        c.insert("b", 2);
+        assert!(c.contains(&"a"));
+        assert!(c.contains(&"b"));
+        assert_eq!(c.get(&"a"), Some(1));
+        assert_eq!(c.get(&"b"), Some(2));
+        assert_eq!(c.node_map.len(), 2);
+        assert!(c.head.is_some());
+        assert!(c.tail.is_some());
+    }
+
+    #[test]
+    fn get_promotes_to_head() {
+        let mut c = CacheShard::with_capacity(3);
+        c.insert("a", 1);
+        c.insert("b", 2);
+        c.insert("c", 3);
+
+        assert_eq!(c.get(&"a"), Some(1));
+
+        c.insert("d", 4);
+
+        assert!(c.contains(&"a"));
+        assert!(c.contains(&"c"));
+        assert!(c.contains(&"d"));
+        assert!(!c.contains(&"b"));
+    }
+
+    #[test]
+    fn update_changes_value_and_promotes() {
+        let mut c = CacheShard::with_capacity(2);
+        c.insert("x", 10);
+        c.insert("y", 20);
+
+        c.update(&"x", 11).unwrap();
+        assert_eq!(c.get(&"x"), Some(11));
+
+        c.insert("z", 30);
+        assert!(c.contains(&"x"));
+        assert!(c.contains(&"z"));
+        assert!(!c.contains(&"y"));
+    }
+
+    #[test]
+    fn eviction_order_at_capacity() {
+        let mut c = LruCache::with_capacity(2);
+        c.insert(1, "a");
+        c.insert(2, "b");
+
+        assert_eq!(c.get(&1), Some("a"));
+
+        c.insert(3, "c");
+
+        assert!(c.contains(&1));
+        assert!(c.contains(&3));
+        assert!(!c.contains(&2));
+    }
+
+    #[test]
+    fn drain_empties_cache() {
+        let mut c = CacheShard::with_capacity(3);
+        c.insert("a", 1);
+        c.insert("b", 2);
+        c.insert("c", 3);
+        c.drain();
+        assert_eq!(c.node_map.len(), 0);
+        assert!(c.head.is_none());
+        assert!(c.tail.is_none());
+        assert_eq!(c.get(&"a"), None);
+    }
+
+    #[test]
+    fn many_inserts_and_accesses_preserve_invariants() {
+        let mut c = CacheShard::with_capacity(5);
+        for i in 0..10 {
+            c.insert(i, i * 10);
+            assert_eq!(c.head.is_some(), c.tail.is_some());
+            assert!(c.node_map.len() <= 5);
+        }
+
+        for i in [7, 8, 9] {
+            assert_eq!(c.get(&i), Some(i * 10));
+            assert_eq!(c.head.is_some(), c.tail.is_some());
+        }
+
+        let keys: HashSet<_> = c.node_map.keys().cloned().collect();
+        assert_eq!(keys.len(), c.node_map.len());
+        assert!(c.node_map.len() <= 5);
+    }
+
+    #[test]
+    fn len() {
+        let mut c = CacheShard::with_capacity(3);
+        c.insert("a", 1);
+        c.insert("b", 2);
+        c.insert("c", 3);
+        assert_eq!(c.len(), 3)
+    }
+
+    #[test]
+    fn pop() {
+        let mut c = CacheShard::with_capacity(3);
+        c.insert("a", 1);
+        c.insert("b", 2);
+        c.insert("c", 3);
+        assert_eq!(c.pop(&"a"), Some(1));
+        assert_eq!(c.pop(&"c"), Some(3));
+        assert_eq!(c.pop(&"a"), None);
+        assert_eq!(c.pop(&"b"), Some(2));
+        assert_eq!(c.len(), 0);
+    }
+
+    #[test]
+    fn full_and_empty() {
+        let mut c = CacheShard::with_capacity(3);
+        c.insert("a", 1);
+        c.insert("b", 2);
+        c.insert("c", 3);
+        assert!(c.is_full());
+        assert_eq!(c.pop(&"a"), Some(1));
+        assert_eq!(c.pop(&"c"), Some(3));
+        assert_eq!(c.pop(&"a"), None);
+        assert_eq!(c.pop(&"b"), Some(2));
+        assert!(c.is_empty());
     }
 }
