@@ -77,6 +77,7 @@ where
 ///All other APIs may mutate the cache shard, thus requiring locking mutable references.
 ///This type wraps all shared internally in an tokio::sync::Arc, so wrapping this type in Arc is
 ///not required by users.
+#[derive(Clone)]
 pub struct DashCache<K, T> {
     inner: Arc<InnerCacheShards<K, T>>,
 }

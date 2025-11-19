@@ -107,6 +107,19 @@ where
         self.node_map.len()
     }
 
+    pub fn head(&self) -> Option<K> {
+        match self.head {
+            Some(ref weak_head) => {
+                let Some(head) = weak_head.upgrade() else {
+                    return None;
+                };
+
+                Some(head.borrow().key.clone())
+            }
+            None => None,
+        }
+    }
+
     pub fn pop(&mut self, key: &K) -> Option<T> {
         let Some(cache_entry) = self.node_map.remove(key) else {
             return None;
@@ -627,20 +640,6 @@ where
                 self.tail = None;
             }
         }
-
-        /*
-                if let Some(mut prev) = prev_opt {
-                    unsafe { prev.as_mut().next = next_opt }
-                } else {
-                    self.head = next_opt
-                }
-
-                if let Some(mut next) = next_opt {
-                    unsafe { next.as_mut().prev = prev_opt }
-                } else {
-                    self.tail = prev_opt
-                }
-        */
 
         unsafe {
             node.as_mut().prev = None;
