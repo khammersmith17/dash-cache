@@ -1,7 +1,24 @@
 [package]
-name = "lru_cache"
+name = "lru_cache_rs"
 version = "0.1.0"
 edition = "2024"
+
+[build]
+rustflags = ["-C", "target-cpu=native"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+incremental = false
+debug-assertions = false
+overflow-checks = false
+strip = "symbols"
+panic = "abort"
+
+[profile.bench]
+inherits = "release"
+
 
 [dependencies]
 ahash = "0.8.12"
@@ -9,3 +26,14 @@ futures = "0.3.31"
 num_cpus = "1.17.0"
 thiserror = "2.0.17"
 tokio = {version = "1.44", features = ["full"]}
+
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+rand = "0.8"
+tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "time"] }
+lru = "0.16.2"
+
+[[bench]]
+name = "lru_cache"
+harness = false

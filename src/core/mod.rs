@@ -1,13 +1,10 @@
 use core::ptr::NonNull;
 use std::cell::{Ref, RefCell, RefMut};
-use std::collections::HashMap;
+//use std::collections::HashMap;
+use ahash::{HashMap, HashMapExt};
 use std::hash::Hash;
 use std::rc::{Rc, Weak};
 use thiserror::Error;
-
-//TODO:
-//implement thread safe methods for thread safe version
-//implement cache stats and add reporting methods
 
 #[derive(Debug, Error)]
 pub enum CacheError {
@@ -103,7 +100,10 @@ where
 
     /// Returns the number of items currently in the cache.
     pub fn len(&self) -> usize {
-        debug_assert_eq!(self.node_map.len(), self.linked_list_len());
+        #[cfg(debug_assertions)]
+        {
+            debug_assert_eq!(self.node_map.len(), self.linked_list_len());
+        }
         self.node_map.len()
     }
 
@@ -208,7 +208,10 @@ where
     /// If the key currently exists in the cache, the value is updated
     /// Key value pair is promoted to most recently used.
     pub fn insert(&mut self, key: K, value: T) {
-        self.assert_invariants();
+        #[cfg(debug_assertions)]
+        {
+            self.assert_invariants();
+        }
         match self.node_map.contains_key(&key) {
             true => {
                 let _ = self.update(&key, value);
@@ -251,7 +254,10 @@ where
 
     #[inline]
     fn unlink_node(&mut self, node: &Rc<RefCell<CacheEntry<K, T>>>) {
-        self.assert_invariants();
+        #[cfg(debug_assertions)]
+        {
+            self.assert_invariants();
+        }
         // if the list is empty, then no movement needs to happen
         if self.is_empty() {
             return;
@@ -317,7 +323,10 @@ where
 
     #[inline]
     fn push_node_to_head(&mut self, node: Weak<RefCell<CacheEntry<K, T>>>) {
-        self.assert_invariants();
+        #[cfg(debug_assertions)]
+        {
+            self.assert_invariants();
+        }
         // if the list is empty set the node to be the head and tail
         if self.is_empty() {
             self.head = Some(node.clone());
@@ -374,7 +383,10 @@ where
 
     #[inline]
     fn pop_tail(&mut self) {
-        self.assert_invariants();
+        #[cfg(debug_assertions)]
+        {
+            self.assert_invariants();
+        }
         self.stats.eviction();
 
         let curr_tail_weak_ref = self.tail.clone().unwrap();
@@ -401,7 +413,10 @@ where
     /// Key value pair will then be promoted to most recently used.
     /// When they Key does not exist in the cache, None will be returned.
     pub fn get(&mut self, key: &K) -> Option<T> {
-        self.assert_invariants();
+        #[cfg(debug_assertions)]
+        {
+            self.assert_invariants();
+        }
         if self.head.is_none() {
             return None;
         }
@@ -443,7 +458,7 @@ struct ShardCacheEntry<K, T> {
 }
 
 // per shard cache table
-pub(crate) struct CacheShard<K, T> {
+pub struct CacheShard<K, T> {
     cap: usize,
     node_map: HashMap<K, Box<ShardCacheEntry<K, T>>>,
     head: Option<NonNull<ShardCacheEntry<K, T>>>,
@@ -575,20 +590,26 @@ where
             // ignoring error here as path only taken when the key exists
             let _ = self.update(&key, value);
         } else {
-            let node = ShardCacheEntry {
-                key: key.clone(),
-                value,
-                prev: None,
-                next: None,
+            let ptr = if self.is_full() {
+                let mut stale_entry = self.pop_tail();
+                stale_entry.key = key.clone();
+                stale_entry.value = value;
+                stale_entry.prev = None;
+                let ptr = NonNull::from(stale_entry.as_mut());
+                self.node_map.insert(key, stale_entry);
+                ptr
+            } else {
+                let node = ShardCacheEntry {
+                    key: key.clone(),
+                    value,
+                    prev: None,
+                    next: None,
+                };
+                let mut boxed_node = Box::new(node);
+                let ptr = NonNull::from(boxed_node.as_mut());
+                self.node_map.insert(key, boxed_node);
+                ptr
             };
-
-            if self.is_full() {
-                self.pop_tail();
-            }
-
-            let mut boxed_node = Box::new(node);
-            let ptr = NonNull::from(boxed_node.as_mut());
-            self.node_map.insert(key, boxed_node);
 
             self.push_node_to_head(ptr);
         }
@@ -602,7 +623,7 @@ where
         self.node_map.clear();
     }
 
-    #[inline]
+    #[inline(always)]
     fn unlink_node(&mut self, mut node: NonNull<ShardCacheEntry<K, T>>) {
         #[cfg(debug_assertions)]
         {
@@ -647,7 +668,7 @@ where
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn push_node_to_head(&mut self, mut node: NonNull<ShardCacheEntry<K, T>>) {
         // this method assumes that a node is fully unlinked before being pushed to the head
         #[cfg(debug_assertions)]
@@ -692,8 +713,8 @@ where
         }
     }
 
-    #[inline]
-    fn pop_tail(&mut self) {
+    #[inline(always)]
+    fn pop_tail(&mut self) -> Box<ShardCacheEntry<K, T>> {
         // method assumes that it is only called when the cache is at capacity, requiring an
         // eviction
         #[cfg(debug_assertions)]
@@ -711,8 +732,7 @@ where
         let tail_ptr = self.tail.unwrap();
         self.unlink_node(tail_ptr);
 
-        let key = unsafe { tail_ptr.as_ref().key.clone() };
-        self.node_map.remove(&key);
+        unsafe { self.node_map.remove(&tail_ptr.as_ref().key).unwrap() }
     }
 
     /// Fetch value from the cache for associated key.
