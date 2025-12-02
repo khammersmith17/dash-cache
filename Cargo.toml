@@ -18,6 +18,7 @@ panic = "abort"
 
 [profile.bench]
 inherits = "release"
+debug = true
 
 
 [dependencies]
@@ -35,5 +36,9 @@ tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "time"] }
 lru = "0.16.2"
 
 [[bench]]
-name = "lru_cache"
+name = "put_then_get_with_eviction"
+harness = false
+
+[[bench]]
+name = "put_then_get_no_eviction"
 harness = false

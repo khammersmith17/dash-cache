@@ -551,6 +551,8 @@ where
         Ok(())
     }
 
+    /// Pop an entry from the cache, forcing an eviction. Returns the value associated with the key
+    /// is the key is currently in the cache, None otherwise.
     pub fn pop(&mut self, key: &K) -> Option<T> {
         let Some(mut cache_entry) = self.node_map.remove(key) else {
             return None;
@@ -587,32 +589,36 @@ where
     /// Key value pair is promoted to most recently used.
     pub fn insert(&mut self, key: K, value: T) {
         if self.contains(&key) {
-            // ignoring error here as path only taken when the key exists
             let _ = self.update(&key, value);
-        } else {
-            let ptr = if self.is_full() {
-                let mut stale_entry = self.pop_tail();
-                stale_entry.key = key.clone();
-                stale_entry.value = value;
-                stale_entry.prev = None;
-                let ptr = NonNull::from(stale_entry.as_mut());
-                self.node_map.insert(key, stale_entry);
-                ptr
-            } else {
-                let node = ShardCacheEntry {
-                    key: key.clone(),
-                    value,
-                    prev: None,
-                    next: None,
-                };
-                let mut boxed_node = Box::new(node);
-                let ptr = NonNull::from(boxed_node.as_mut());
-                self.node_map.insert(key, boxed_node);
-                ptr
-            };
-
-            self.push_node_to_head(ptr);
+            return;
         }
+
+        // if eviction is needed, reuse already allocated entry
+        let ptr = if self.is_full() {
+            let mut stale_entry = self.pop_tail();
+            stale_entry.key = key.clone();
+            stale_entry.value = value;
+            stale_entry.prev = None;
+            // next should already be None
+            stale_entry.next = None;
+            let ptr = NonNull::from(stale_entry.as_mut());
+            self.node_map.insert(key, stale_entry);
+            ptr
+        } else {
+            // if there is still capacity available, allocate a new entry
+            let node = ShardCacheEntry {
+                key: key.clone(),
+                value,
+                prev: None,
+                next: None,
+            };
+            let mut boxed_node = Box::new(node);
+            let ptr = NonNull::from(boxed_node.as_mut());
+            self.node_map.insert(key, boxed_node);
+            ptr
+        };
+
+        self.push_node_to_head(ptr);
     }
 
     /// Empty the cache.
