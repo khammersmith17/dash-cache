@@ -1,5 +1,5 @@
 [package]
-name = "lru_cache_rs"
+name = "dash_cache"
 version = "0.1.0"
 edition = "2024"
 
@@ -41,4 +41,8 @@ harness = false
 
 [[bench]]
 name = "put_then_get_no_eviction"
+harness = false
+
+[[bench]]
+name = "dash_cache_bench"
 harness = false

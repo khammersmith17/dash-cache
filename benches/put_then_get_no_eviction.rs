@@ -1,5 +1,5 @@
 use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use lru_cache_rs::core::LruCache;
+use dash_cache::core::LruCache;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 
 fn bench_insert_get_sync(c: &mut Criterion) {
@@ -61,7 +61,7 @@ fn bench_insert_get_sync_lru_bench(c: &mut Criterion) {
     group.finish();
 }
 
-use lru_cache_rs::core::CacheShard;
+use dash_cache::core::CacheShard;
 fn bench_insert_get_sync_single_threaded_shard(c: &mut Criterion) {
     let mut group = c.benchmark_group("single_threaded_shard");
     for &cap in &[1_000usize, 10_000] {

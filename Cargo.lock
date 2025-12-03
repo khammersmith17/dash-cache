@@ -200,6 +200,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
+name = "dash_cache"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "criterion",
+ "futures",
+ "lru",
+ "num_cpus",
+ "rand",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -415,20 +429,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96051b46fc183dc9cd4a223960ef37b9af631b55191852a8274bfef064cda20f"
 dependencies = [
  "hashbrown",
-]
-
-[[package]]
-name = "lru_cache_rs"
-version = "0.1.0"
-dependencies = [
- "ahash",
- "criterion",
- "futures",
- "lru",
- "num_cpus",
- "rand",
- "thiserror",
- "tokio",
 ]
 
 [[package]]
