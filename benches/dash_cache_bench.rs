@@ -21,6 +21,7 @@ fn bench_dashcache_async_sequential(rt: &Runtime, c: &mut Criterion) {
                     .map(|_| rng.gen_range(0..(cap as usize)) as u64)
                     .collect();
                 async move {
+                    cache_c.drain().await;
                     for i in 0..(cap as usize) {
                         cache_c.insert(i as u64, i as u64).await;
                     }

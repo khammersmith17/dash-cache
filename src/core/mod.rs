@@ -70,7 +70,10 @@ struct CacheEntry<K, T> {
 /// LruCache is desgined for single threaded access or to be used in a non async context.
 /// Initializing with capacity is required.
 /// When the cache is full, the least recently used item will be evicted.
-/// A use is defined as a write to the cache or a read from the cache.
+/// A use is defined as a write to the cache or a read from the cache. This type is fully safe.
+/// Performance in debug mode may not be optimal, due to the internal variant assertions to ensure
+/// correct behavior. All data accesses return copies due to internal borrowing mechanics.
+/// Hopefully this can be improved in later versions.
 #[derive(Debug)]
 pub struct LruCache<K, T> {
     cap: usize,
@@ -85,7 +88,7 @@ where
     K: Hash + Eq + Clone + std::fmt::Debug,
     T: Clone + std::fmt::Debug,
 {
-    /// Only provided constructor
+    /// This is the only provided constructor.
     /// Will initialize an LruCache with the requested capacity
     pub fn with_capacity(cap: usize) -> LruCache<K, T> {
         let node_map: HashMap<K, Rc<RefCell<CacheEntry<K, T>>>> = HashMap::with_capacity(cap);
@@ -107,6 +110,8 @@ where
         self.node_map.len()
     }
 
+    /// Get a refernce to the key that is currently the most recently used entry in the cache, which is
+    /// also the head.
     pub fn head(&self) -> Option<K> {
         match self.head {
             Some(ref weak_head) => {
@@ -120,6 +125,7 @@ where
         }
     }
 
+    /// Pop the least recently used entry in the cache.
     pub fn pop(&mut self, key: &K) -> Option<T> {
         let Some(cache_entry) = self.node_map.remove(key) else {
             return None;
@@ -195,18 +201,23 @@ where
         Ok(())
     }
 
-    // empty is defined as both head and tail are None and the internal node_map is empty
+    /// Returns whether the cache is empty or not. Empty is defined as both head and tail of the internal linked list are
+    /// None and the internal entry table is empty. The valid variants are that both are true or
+    /// neither is true.
     pub fn is_empty(&self) -> bool {
         self.head.is_none() && self.tail.is_none() && self.len() == 0
     }
 
+    /// Returns whether or not the cache is at capacity. When the cache is at capacity, the next
+    /// insert into the cache will lead to eviction.
     pub fn is_full(&self) -> bool {
         self.len() == self.cap
     }
 
     /// Insert value into the cache.
-    /// If the key currently exists in the cache, the value is updated
-    /// Key value pair is promoted to most recently used.
+    /// If the key currently exists in the cache, the associated value is updated.
+    /// Key value pair is either promoted to most recently used if it exists, or inserted as most
+    /// recently used.
     pub fn insert(&mut self, key: K, value: T) {
         #[cfg(debug_assertions)]
         {
@@ -244,6 +255,7 @@ where
         self.node_map.clear();
     }
 
+    // internal method to run in debug mode and assert that invariants are always consistent.
     #[cfg(debug_assertions)]
     fn assert_invariants(&self) {
         debug_assert!(
@@ -252,6 +264,7 @@ where
         )
     }
 
+    // remove the node from its current position in the list determining usage recency.
     #[inline]
     fn unlink_node(&mut self, node: &Rc<RefCell<CacheEntry<K, T>>>) {
         #[cfg(debug_assertions)]
@@ -321,6 +334,7 @@ where
         node_ref.next = None;
     }
 
+    // pushed node to the front of the list determining how recently an entry was used/inserted.
     #[inline]
     fn push_node_to_head(&mut self, node: Weak<RefCell<CacheEntry<K, T>>>) {
         #[cfg(debug_assertions)]
@@ -356,6 +370,8 @@ where
         self.head = Some(node)
     }
 
+    // debug only method to get the length of the internal list. This is to assert that the number
+    // of nodes in the internal map equals the number of nodes in the recency list.
     #[cfg(debug_assertions)]
     fn linked_list_len(&self) -> usize {
         let mut len = 0_usize;
@@ -381,6 +397,7 @@ where
         len
     }
 
+    // Upon eviction, pop the entry off the recency list.
     #[inline]
     fn pop_tail(&mut self) {
         #[cfg(debug_assertions)]
@@ -442,7 +459,6 @@ where
                 }
             }
         }
-
         res
     }
 }
@@ -457,7 +473,11 @@ struct ShardCacheEntry<K, T> {
     prev: Option<NonNull<ShardCacheEntry<K, T>>>,
 }
 
-// per shard cache table
+/// This is unsafe implementation of an LRU Cache, and it the cache type used in the shards of the
+/// 'DashCache' type. Debug performance is non-optimal. Given the unsafe nature, invariant
+/// assertions are run on every cache operation to maintain correct state. In release builds, the
+/// performance is quite good, consist with other crates such as lru.
+/// Hopefully this can be improved in later versions.
 pub struct CacheShard<K, T> {
     cap: usize,
     node_map: HashMap<K, Box<ShardCacheEntry<K, T>>>,
@@ -484,7 +504,7 @@ where
     K: Hash + Eq + Clone,
     T: Clone,
 {
-    /// Only provided constructor
+    /// This is the Only provided constructor.
     /// Will initialize an LruCache with the requested capacity
     pub fn with_capacity(cap: usize) -> CacheShard<K, T> {
         if cap == 0 {
@@ -574,12 +594,15 @@ where
         Some(value)
     }
 
-    // empty is defined as both head and tail are None and the internal node_map is empty
+    /// Returns whether or not the cache is currently empty. Empty is defined as both head and tail are None and the internal
+    /// entry table is empty.
     #[allow(unused)]
     pub fn is_empty(&self) -> bool {
         self.head.is_none() && self.tail.is_none() && self.len() == 0
     }
 
+    /// Returns whether the cache is full. When the cache is full, the next insert will force an
+    /// eviction.
     pub fn is_full(&self) -> bool {
         self.node_map.len() == self.cap
     }
@@ -774,6 +797,8 @@ where
         Some(value)
     }
 
+    /// Statistics are kept internally detailing the number of cache hits, misses, and evictions
+    /// for promoting operations.
     pub fn statistics(&self) -> CacheStats {
         self.stats.clone()
     }

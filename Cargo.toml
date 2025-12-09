@@ -3,10 +3,7 @@ name = "dash_cache"
 version = "0.1.0"
 edition = "2024"
 
-[build]
-rustflags = ["-C", "target-cpu=native"]
-
-[profile.release]
+[profile.bench]
 opt-level = 3
 lto = "thin"
 codegen-units = 1
@@ -15,9 +12,6 @@ debug-assertions = false
 overflow-checks = false
 strip = "symbols"
 panic = "abort"
-
-[profile.bench]
-inherits = "release"
 debug = true
 
 
