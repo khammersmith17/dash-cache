@@ -19,7 +19,7 @@ where
     K: Hash + Eq + Clone,
     T: Clone,
 {
-    fn with_capacity(cap: usize) -> LockedCache<K, T> {
+    fn with_capacity(cap: NonZeroUsize) -> LockedCache<K, T> {
         let cache: CacheShard<K, T> = CacheShard::with_capacity(cap);
         let handle = RwLock::new(cache);
         LockedCache { handle }
@@ -51,9 +51,9 @@ where
         value
     }
 
-    async fn pop(&self, key: &K) -> Option<T> {
+    async fn evict(&self, key: &K) -> Option<T> {
         let mut guard = self.handle.write().await;
-        guard.pop(key)
+        guard.evict(key)
     }
 
     async fn update(&self, key: &K, value: T) -> Result<(), CacheError> {
@@ -92,7 +92,7 @@ where
     /// will have capacity of size 1. In the case where capacity is not evenly divided by the
     /// number of cpu cores available, each shard capacity rounds up to the next unsigned integer
     /// value.
-    pub fn new(cap: u64) -> DashCache<K, T> {
+    pub fn new(cap: NonZeroUsize) -> DashCache<K, T> {
         let inner = Arc::new(InnerCacheShards::new(cap));
 
         DashCache { inner }
@@ -101,8 +101,8 @@ where
     /// Explicility define the number of shards and capacity per shard, total capacity will then be
     /// num_shards * shard_capacity.
     pub fn with_num_shards_and_capacity(
-        num_shards: usize,
-        shard_capacity: usize,
+        num_shards: NonZeroUsize,
+        shard_capacity: NonZeroUsize,
     ) -> DashCache<K, T> {
         let inner = Arc::new(InnerCacheShards::with_num_shards_and_capacity(
             num_shards,
@@ -147,8 +147,8 @@ where
     }
 
     /// Pop an entry from the cache.
-    pub async fn pop(&self, key: &K) -> Option<T> {
-        self.inner.pop(key).await
+    pub async fn evict(&self, key: &K) -> Option<T> {
+        self.inner.evict(key).await
     }
 
     pub async fn len(&self) -> usize {
@@ -201,19 +201,18 @@ where
     K: Hash + Eq + Clone + Send + Sync + 'static,
     T: Clone + Send + Sync + 'static,
 {
-    fn new(cap: u64) -> InnerCacheShards<K, T> {
-        if cap == 0 {
-            panic!("reqeusted capacity must be greater than zero");
-        }
+    fn new(capacity: NonZeroUsize) -> InnerCacheShards<K, T> {
         let cpu_count = num_cpus::get();
-        let mut shards_vec: Vec<LockedCache<K, T>> = Vec::with_capacity(cpu_count);
 
-        let shard_size = ((cap as f32 / cpu_count as f32).ceil() as usize).max(1_usize);
+        let cap = capacity.get();
 
-        for _ in 0..cpu_count {
-            let shard: LockedCache<K, T> = LockedCache::with_capacity(shard_size as usize);
-            shards_vec.push(shard);
-        }
+        let shard_capacity =
+            NonZeroUsize::new(((cap as f32 / cpu_count as f32).ceil() as usize).max(1_usize))
+                .unwrap();
+
+        let shards_vec: Vec<LockedCache<K, T>> = (0..cpu_count)
+            .map(|_| LockedCache::with_capacity(shard_capacity))
+            .collect();
 
         let cache_shards = shards_vec.into_boxed_slice();
         let num_shards = unsafe { NonZeroUsize::new_unchecked(cpu_count) };
@@ -225,24 +224,16 @@ where
     }
 
     fn with_num_shards_and_capacity(
-        num_shards: usize,
-        shard_capacity: usize,
+        num_shards: NonZeroUsize,
+        shard_capacity: NonZeroUsize,
     ) -> InnerCacheShards<K, T> {
-        if num_shards == 0 || shard_capacity == 0 {
-            panic!("num_chards and shard_capacity must non zero")
-        }
-        let mut shards_vec: Vec<LockedCache<K, T>> = Vec::with_capacity(num_shards);
+        let shard_count = num_shards.get();
+        let shards_vec: Vec<LockedCache<K, T>> = (0..num_shards.get())
+            .map(|_| LockedCache::with_capacity(shard_capacity))
+            .collect();
 
-        for _ in 0..num_shards {
-            let shard: LockedCache<K, T> = LockedCache::with_capacity(shard_capacity);
-            shards_vec.push(shard);
-        }
-
-        // in the case that the vec is over allocated
-        // make the heap shard allocation more compact
-        shards_vec.shrink_to_fit();
         let cache_shards = shards_vec.into_boxed_slice();
-        let num_shards = unsafe { NonZeroUsize::new_unchecked(num_shards) };
+        let num_shards = unsafe { NonZeroUsize::new_unchecked(shard_count) };
 
         InnerCacheShards {
             cache_shards,
@@ -300,10 +291,10 @@ where
         Ok(())
     }
 
-    async fn pop(&self, key: &K) -> Option<T> {
+    async fn evict(&self, key: &K) -> Option<T> {
         let shard_key = self.compute_shard(key);
         let shard_cache = &self.cache_shards[shard_key];
-        shard_cache.pop(key).await
+        shard_cache.evict(key).await
     }
 
     async fn statistics(&self) -> CacheStats {
