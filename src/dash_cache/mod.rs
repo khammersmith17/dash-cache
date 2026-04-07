@@ -68,7 +68,7 @@ where
     }
 }
 
-///This lru cache implementation is an omage to dashmap::DashMap.
+///This lru cache implementation is an homage to dashmap::DashMap.
 ///Interally keys are sharded base on key hash to minimize locking access across threads. Each internal shard cache
 ///is an instance of a thread safe cache table.
 ///Each shard is wrapped in a tokio::RwLock.
@@ -171,7 +171,7 @@ where
     }
 
     /// Utility to fetch the number of shards.
-    pub async fn num_shards(&self) -> usize {
+    pub fn num_shards(&self) -> usize {
         usize::from(self.inner.num_shards)
     }
 }

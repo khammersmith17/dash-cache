@@ -17,9 +17,9 @@ pub enum CacheError {
 
 #[derive(Default, Debug, Clone)]
 pub struct CacheStats {
-    hits: usize,
-    misses: usize,
-    evictions: usize,
+    pub hits: usize,
+    pub misses: usize,
+    pub evictions: usize,
 }
 
 impl std::ops::Add<CacheStats> for CacheStats {
@@ -498,10 +498,6 @@ where
     /// Will initialize an LruCache with the requested capacity
     pub fn with_capacity(capacity: NonZeroUsize) -> CacheShard<K, T> {
         let cap = capacity.get();
-        if cap == 0 {
-            panic!("capacity must be > 0");
-        }
-
         let node_map: HashMap<K, Box<ShardCacheEntry<K, T>>> = HashMap::with_capacity(cap);
 
         CacheShard {
@@ -812,6 +808,368 @@ where
         }
 
         let value = unsafe { entry_ptr.as_ref().value.clone() };
+
+        Some(value)
+    }
+
+    /// Statistics are kept internally detailing the number of cache hits, misses, and evictions
+    /// for promoting operations.
+    pub fn statistics(&self) -> CacheStats {
+        self.stats.clone()
+    }
+}
+
+struct CacheSlabEntry<K: Hash + Eq + Clone, V: Clone> {
+    key: K,
+    value: V,
+    prev: Option<u32>,
+    next: Option<u32>,
+}
+
+pub struct IndexedCacheShard<K: Hash + Eq + Clone, V: Clone> {
+    cap: usize,
+    slab: Vec<CacheSlabEntry<K, V>>,
+    node_map: HashMap<K, u32>,
+    head: Option<u32>,
+    tail: Option<u32>,
+    stats: CacheStats,
+}
+
+impl<K, V> IndexedCacheShard<K, V>
+where
+    K: Hash + Eq + Clone,
+    V: Clone,
+{
+    /// This is the Only provided constructor.
+    /// Will initialize an LruCache with the requested capacity
+    pub fn with_capacity(capacity: NonZeroUsize) -> IndexedCacheShard<K, V> {
+        let cap = capacity.get();
+        if cap as u32 > u32::MAX {
+            panic!("capacity must be <= {}", u32::MAX);
+        }
+
+        let node_map: HashMap<K, u32> = HashMap::with_capacity(cap);
+
+        IndexedCacheShard {
+            cap,
+            node_map,
+            slab: Vec::with_capacity(cap),
+            head: None,
+            tail: None,
+            stats: CacheStats::default(),
+        }
+    }
+
+    /// Returns whether or not a key exists in the cache.
+    /// This method is not defined as a use, thus accessing this key will not promote the item.
+    pub fn contains(&self, key: &K) -> bool {
+        self.node_map.contains_key(key)
+    }
+
+    pub fn len(&self) -> usize {
+        self.slab.len()
+    }
+
+    /// Safety: This method should only be called when the cache is non empty, ie when there is an
+    /// entry in the cache to update. A ptr needs to be available. The ptr provided is from a cache
+    /// entry, dictating that the cache is not empty, thus head should be Some.
+    /// Debug assertion validates that behavior.
+    #[inline(always)]
+    fn update_cache_entry(&mut self, entry_idx: u32, value: V) {
+        debug_assert!(self.head.is_some());
+        let head_idx = self.head.unwrap();
+        if head_idx != entry_idx {
+            self.unlink_node(entry_idx);
+            self.push_node_to_head(entry_idx);
+        }
+
+        // at this point we have validated that the pointer is non null
+        // and a mutable update is safe
+        unsafe { self.slab.get_unchecked_mut(entry_idx as usize).value = value };
+    }
+
+    /// Update an item that exists in the cache.
+    /// If the requested key does not exist in the cache, a CacheError will be returned.
+    /// On success, a unit type value is returned.
+    /// When the value of a key value pair is updated, this key value pair is promoted to most
+    /// recently used. There is no get_mut method on this type due to borrowing semantic
+    /// limitations, use this method any time you would like to mutate the value stored with a
+    /// given key.
+    pub fn update(&mut self, key: &K, value: V) -> Result<(), CacheError> {
+        debug_assert!(
+            (self.head.is_some() && self.tail.is_some())
+                || (self.head.is_none() && self.tail.is_none())
+        );
+        let Some(entry_idx) = self.node_map.get(key) else {
+            return Err(CacheError::KeyNotExist);
+        };
+        self.stats.hit();
+        self.update_cache_entry(*entry_idx, value);
+
+        Ok(())
+    }
+
+    /// Pop an entry from the cache, forcing an eviction. Returns the value associated with the key
+    /// is the key is currently in the cache, None otherwise.
+    pub fn evict(&mut self, key: &K) -> Option<V> {
+        let Some(entry_idx) = self.node_map.remove(key) else {
+            return None;
+        };
+
+        self.unlink_node(entry_idx);
+
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(
+                (self.head.is_some() && self.tail.is_some())
+                    || (self.head.is_none() && self.tail.is_none())
+            )
+        }
+        let len = self.len();
+        if len > 1 && entry_idx as usize != len - 1 {
+            let (swap_key, swap_prev, swap_next) = unsafe {
+                let entry = &self.slab.get_unchecked(len - 1);
+                (&entry.key, entry.prev, entry.next)
+            };
+            *self.node_map.get_mut(&swap_key).unwrap() = entry_idx;
+            if let Some(swap_prev) = swap_prev {
+                unsafe { self.slab.get_unchecked_mut(swap_prev as usize).next = Some(entry_idx) };
+            }
+            if let Some(swap_next) = swap_next {
+                unsafe { self.slab.get_unchecked_mut(swap_next as usize).prev = Some(entry_idx) };
+            }
+            if self.head == Some(len as u32 - 1) {
+                self.head = Some(entry_idx)
+            }
+            if self.tail == Some(len as u32 - 1) {
+                self.tail = Some(entry_idx)
+            }
+        }
+
+        let CacheSlabEntry { value, .. } = self.slab.swap_remove(entry_idx as usize);
+        Some(value)
+    }
+
+    /// Returns whether or not the cache is currently empty. Empty is defined as both head and tail are None and the internal
+    /// entry table is empty.
+    #[allow(unused)]
+    pub fn is_empty(&self) -> bool {
+        self.head.is_none() && self.tail.is_none() && self.len() == 0
+    }
+
+    /// Returns whether the cache is full. When the cache is full, the next insert will force an
+    /// eviction.
+    pub fn is_full(&self) -> bool {
+        self.node_map.len() == self.cap
+    }
+
+    /// Insert value into the cache.
+    /// If the key currently exists in the cache, the value is updated
+    /// Key value pair is promoted to most recently used.
+    /*
+     * Implementation.
+     * - When cache is saturated
+     *   - when insert key is a cache hit, update the value
+     *   - Otherwise, reuse evicted entry memory allocation, and overwrite with new entry
+     * - Otherwise:
+     *   - Use entry api to avoid double lookup
+     *   - if enrty is occupied, get the entry and use update api
+     *   - otherwise, allocate and init a new entry
+     *
+     * Note: head promotion is handled in update method. Paths that lead to node update do not
+     * promoted the entry to the head.
+     * */
+    pub fn insert(&mut self, key: K, value: V) {
+        let idx = if self.is_full() {
+            match self.node_map.get(&key) {
+                Some(entry_idx) => {
+                    self.update_cache_entry(*entry_idx, value);
+                    return;
+                }
+                None => {
+                    let stale_idx = self.pop_tail();
+                    let stale_entry = unsafe { self.slab.get_unchecked_mut(stale_idx as usize) };
+                    stale_entry.key = key.clone();
+                    stale_entry.value = value;
+                    stale_entry.prev = None;
+                    // next should already be None
+                    stale_entry.next = None;
+                    self.node_map.insert(key, stale_idx);
+                    stale_idx
+                }
+            }
+        } else {
+            match self.node_map.entry(key.clone()) {
+                Entry::Occupied(occ_entry_idx) => {
+                    let entry_idx = *occ_entry_idx.get();
+                    self.update_cache_entry(entry_idx, value);
+                    return;
+                }
+                Entry::Vacant(vac_entry) => {
+                    let new_entry = CacheSlabEntry {
+                        key,
+                        value,
+                        prev: None,
+                        next: None,
+                    };
+                    let entry_idx = self.slab.len();
+                    self.slab.push(new_entry);
+                    vac_entry.insert_entry(entry_idx as u32);
+                    entry_idx as u32
+                }
+            }
+        };
+
+        self.push_node_to_head(idx);
+    }
+
+    /// Empty the cache.
+    /// After this call, cache will be empty.
+    pub fn drain(&mut self) {
+        self.head = None;
+        self.tail = None;
+        self.node_map.clear();
+    }
+
+    #[inline(always)]
+    fn unlink_node(&mut self, entry_idx: u32) {
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(
+                (self.head.is_some() && self.tail.is_some())
+                    || (self.head.is_none() && self.tail.is_none())
+            );
+        }
+
+        let (prev_opt, next_opt) = {
+            let entry: &mut CacheSlabEntry<K, V> =
+                unsafe { self.slab.get_unchecked_mut(entry_idx as usize) };
+            let (prev_opt, next_opt) = (entry.prev.clone(), entry.next.clone());
+            entry.prev = None;
+            entry.next = None;
+            (prev_opt, next_opt)
+        };
+
+        match (prev_opt, next_opt) {
+            (Some(prev), Some(next)) => {
+                // node is in the middle of the list
+                unsafe { self.slab.get_unchecked_mut(prev as usize).next = next_opt }
+                unsafe { self.slab.get_unchecked_mut(next as usize).prev = prev_opt }
+            }
+            (Some(prev), None) => {
+                // node is current the tail
+                unsafe { self.slab.get_unchecked_mut(prev as usize).next = None }
+                self.tail = prev_opt
+            }
+            (None, Some(next)) => {
+                // node is current head
+                unsafe { self.slab.get_unchecked_mut(next as usize).prev = None }
+                self.head = next_opt
+            }
+            (None, None) => {
+                // node is both head and tail
+                // no unlinking required
+                self.head = None;
+                self.tail = None;
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn push_node_to_head(&mut self, entry_idx: u32) {
+        /*
+         * Assume the node is unlinked here.
+         * Take the current head, set its prev to new head idx
+         * Set new head idx to prev head, update the head idx
+         * */
+        // this method assumes that a node is fully unlinked before being pushed to the head
+        #[cfg(debug_assertions)]
+        {
+            // assert general invariants
+            // also assert this node is transiently unlinked
+            // unlink op should always happen before pushing to head
+            debug_assert!(
+                (self.head.is_some() && self.tail.is_some())
+                    || (self.head.is_none() && self.tail.is_none())
+            );
+
+            let node: &mut CacheSlabEntry<K, V> =
+                unsafe { self.slab.get_unchecked_mut(entry_idx as usize) };
+            // if we get a cache hit on the key, then head should be Some
+            let (prev, next) = (node.prev, node.next);
+            debug_assert!(prev.is_none() && next.is_none());
+        }
+
+        let node: &mut CacheSlabEntry<K, V> =
+            unsafe { self.slab.get_unchecked_mut(entry_idx as usize) };
+
+        // if the list is non-empty, update the current head prev pointer to point to node
+        // update node next to point to current head
+        // if the list is empty set the node to be the head and tail
+        if let Some(head_idx) = self.head {
+            node.next = self.head;
+            node.prev = None;
+            unsafe { self.slab.get_unchecked_mut(head_idx as usize).prev = Some(entry_idx) }
+            self.head = Some(entry_idx);
+        } else {
+            // when list is currently empty, ensure that both node pointers are null
+
+            // head and tail both get set to current node when cache is empty
+            self.head = Some(entry_idx);
+            self.tail = Some(entry_idx)
+        }
+    }
+
+    #[inline(always)]
+    fn pop_tail(&mut self) -> u32 {
+        // method assumes that it is only called when the cache is at capacity, requiring an
+        // eviction
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(
+                (self.head.is_some() && self.tail.is_some())
+                    || (self.head.is_none() && self.tail.is_none())
+            );
+
+            debug_assert!(self.node_map.len() == self.cap);
+            debug_assert!(self.tail.is_some());
+        }
+
+        // safe unwrap, validate above that tail is Some
+        let tail_idx = self.tail.unwrap();
+        self.unlink_node(tail_idx);
+
+        unsafe {
+            self.node_map
+                .remove(&self.slab.get_unchecked(tail_idx as usize).key)
+                .unwrap()
+        }
+    }
+
+    /// Fetch value from the cache for associated key.
+    /// Key value pair will then be promoted to most recently used.
+    /// When they Key does not exist in the cache, None will be returned.
+    pub fn get(&mut self, key: &K) -> Option<V> {
+        let Some(entry_idx_ref) = self.node_map.get(key) else {
+            return None;
+        };
+        let entry_idx = *entry_idx_ref;
+
+        #[cfg(debug_assertions)]
+        {
+            // if key is cache hit, head and tail must be Some
+            debug_assert!(self.head.is_some() && self.tail.is_some());
+        }
+
+        self.stats.hit();
+
+        let head_idx = self.head.unwrap();
+        if head_idx != entry_idx {
+            self.unlink_node(entry_idx);
+            self.push_node_to_head(entry_idx);
+        }
+
+        let value = unsafe { self.slab.get_unchecked(entry_idx as usize).value.clone() };
 
         Some(value)
     }
@@ -1177,6 +1535,219 @@ mod shard_cache_test {
     #[test]
     fn repeated_reinserts_non_full_maintain_integrity() {
         let mut c = CacheShard::with_capacity(NonZeroUsize::new(10).unwrap());
+        for i in 0..5 {
+            c.insert(i, i * 10);
+        }
+        // repeatedly re-insert the same key with updated values
+        for v in 0..5 {
+            c.insert(2, v);
+        }
+        assert_eq!(c.get(&2), Some(4));
+        assert_eq!(c.len(), 5);
+        // all other keys still reachable
+        assert_eq!(c.get(&0), Some(0));
+        assert_eq!(c.get(&1), Some(10));
+        assert_eq!(c.get(&3), Some(30));
+        assert_eq!(c.get(&4), Some(40));
+    }
+}
+
+#[cfg(test)]
+mod indexed_shard_cache_test {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn constructs_empty() {
+        let c: IndexedCacheShard<i32, i32> =
+            IndexedCacheShard::with_capacity(NonZeroUsize::new(3).unwrap());
+        assert_eq!(c.node_map.len(), 0);
+        assert!(c.head.is_none());
+        assert!(c.tail.is_none());
+    }
+
+    #[test]
+    fn insert_get_contains() {
+        let mut c = IndexedCacheShard::with_capacity(NonZeroUsize::new(3).unwrap());
+        c.insert("a", 1);
+        c.insert("b", 2);
+        assert!(c.contains(&"a"));
+        assert!(c.contains(&"b"));
+        assert_eq!(c.get(&"a"), Some(1));
+        assert_eq!(c.get(&"b"), Some(2));
+        assert_eq!(c.node_map.len(), 2);
+        assert!(c.head.is_some());
+        assert!(c.tail.is_some());
+    }
+
+    #[test]
+    fn get_promotes_to_head() {
+        let mut c = IndexedCacheShard::with_capacity(NonZeroUsize::new(3).unwrap());
+        c.insert("a", 1);
+        c.insert("b", 2);
+        c.insert("c", 3);
+
+        assert_eq!(c.get(&"a"), Some(1));
+
+        c.insert("d", 4);
+
+        assert!(c.contains(&"a"));
+        assert!(c.contains(&"c"));
+        assert!(c.contains(&"d"));
+        assert!(!c.contains(&"b"));
+    }
+
+    #[test]
+    fn update_changes_value_and_promotes() {
+        let mut c = IndexedCacheShard::with_capacity(NonZeroUsize::new(2).unwrap());
+        c.insert("x", 10);
+        c.insert("y", 20);
+
+        c.update(&"x", 11).unwrap();
+        assert_eq!(c.get(&"x"), Some(11));
+
+        c.insert("z", 30);
+        assert!(c.contains(&"x"));
+        assert!(c.contains(&"z"));
+        assert!(!c.contains(&"y"));
+    }
+
+    #[test]
+    fn drain_empties_cache() {
+        let mut c = IndexedCacheShard::with_capacity(NonZeroUsize::new(3).unwrap());
+        c.insert("a", 1);
+        c.insert("b", 2);
+        c.insert("c", 3);
+        c.drain();
+        assert_eq!(c.node_map.len(), 0);
+        assert!(c.head.is_none());
+        assert!(c.tail.is_none());
+        assert_eq!(c.get(&"a"), None);
+    }
+
+    #[test]
+    fn many_inserts_and_accesses_preserve_invariants() {
+        let mut c = IndexedCacheShard::with_capacity(NonZeroUsize::new(5).unwrap());
+        for i in 0..10 {
+            c.insert(i, i * 10);
+            assert_eq!(c.head.is_some(), c.tail.is_some());
+            assert!(c.node_map.len() <= 5);
+        }
+
+        for i in [7, 8, 9] {
+            assert_eq!(c.get(&i), Some(i * 10));
+            assert_eq!(c.head.is_some(), c.tail.is_some());
+        }
+
+        let keys: HashSet<_> = c.node_map.keys().cloned().collect();
+        assert_eq!(keys.len(), c.node_map.len());
+        assert!(c.node_map.len() <= 5);
+    }
+
+    #[test]
+    fn len() {
+        let mut c = IndexedCacheShard::with_capacity(NonZeroUsize::new(3).unwrap());
+        c.insert("a", 1);
+        c.insert("b", 2);
+        c.insert("c", 3);
+        assert_eq!(c.len(), 3)
+    }
+
+    #[test]
+    fn evict() {
+        let mut c = IndexedCacheShard::with_capacity(NonZeroUsize::new(3).unwrap());
+        c.insert("a", 1);
+        c.insert("b", 2);
+        c.insert("c", 3);
+        assert_eq!(c.evict(&"a"), Some(1));
+        assert_eq!(c.evict(&"c"), Some(3));
+        assert_eq!(c.evict(&"a"), None);
+        assert_eq!(c.evict(&"b"), Some(2));
+        assert_eq!(c.len(), 0);
+    }
+
+    #[test]
+    fn full_and_empty() {
+        let mut c = IndexedCacheShard::with_capacity(NonZeroUsize::new(3).unwrap());
+        c.insert("a", 1);
+        c.insert("b", 2);
+        c.insert("c", 3);
+        assert!(c.is_full());
+        assert_eq!(c.evict(&"a"), Some(1));
+        assert_eq!(c.evict(&"c"), Some(3));
+        assert_eq!(c.evict(&"a"), None);
+        assert_eq!(c.evict(&"b"), Some(2));
+        assert!(c.is_empty());
+    }
+
+    // The following tests target the non-full insert path (Entry API occupied branch).
+    // A prior bug called push_node_to_head after update_cache_entry already handled
+    // promotion, corrupting the list. None of the tests above cover a re-insert into
+    // a non-full cache.
+
+    #[test]
+    fn insert_existing_non_head_key_non_full_updates_value() {
+        let mut c = IndexedCacheShard::with_capacity(NonZeroUsize::new(5).unwrap());
+        c.insert(1, 10);
+        c.insert(2, 20);
+        c.insert(3, 30);
+        // cache is non-full, re-insert a non-head key with a new value
+        c.insert(1, 99);
+        assert_eq!(c.get(&1), Some(99));
+        assert_eq!(c.get(&2), Some(20));
+        assert_eq!(c.get(&3), Some(30));
+        assert_eq!(c.len(), 3);
+    }
+
+    #[test]
+    fn insert_existing_non_head_key_non_full_promotes_and_evicts_correctly() {
+        let mut c = IndexedCacheShard::with_capacity(NonZeroUsize::new(5).unwrap());
+        c.insert(1, 10); // tail
+        c.insert(2, 20);
+        c.insert(3, 30); // head
+        // re-insert 1 (tail) — should become head, 2 becomes new tail
+        c.insert(1, 99);
+        // fill to capacity
+        c.insert(4, 40);
+        c.insert(5, 50);
+        // now full; inserting 6 should evict 2, the new LRU
+        c.insert(6, 60);
+        assert!(c.contains(&1));
+        assert!(!c.contains(&2));
+        assert!(c.contains(&3));
+        assert_eq!(c.get(&1), Some(99));
+    }
+
+    #[test]
+    fn insert_existing_head_key_non_full_updates_value() {
+        let mut c = IndexedCacheShard::with_capacity(NonZeroUsize::new(5).unwrap());
+        c.insert(1, 10);
+        c.insert(2, 20); // head
+        // re-insert the current head — list structure must stay consistent
+        c.insert(2, 99);
+        assert_eq!(c.get(&2), Some(99));
+        assert_eq!(c.get(&1), Some(10));
+        assert_eq!(c.len(), 2);
+    }
+
+    #[test]
+    fn insert_existing_head_key_non_full_eviction_order_unchanged() {
+        let mut c = IndexedCacheShard::with_capacity(NonZeroUsize::new(5).unwrap());
+        c.insert(1, 10); // tail
+        c.insert(2, 20);
+        c.insert(3, 30); // head
+        c.insert(3, 99); // re-insert head — 1 should remain tail
+        c.insert(4, 40);
+        c.insert(5, 50); // now full
+        c.insert(6, 60); // evicts 1
+        assert!(!c.contains(&1));
+        assert!(c.contains(&2));
+        assert_eq!(c.get(&3), Some(99));
+    }
+
+    #[test]
+    fn repeated_reinserts_non_full_maintain_integrity() {
+        let mut c = IndexedCacheShard::with_capacity(NonZeroUsize::new(10).unwrap());
         for i in 0..5 {
             c.insert(i, i * 10);
         }
