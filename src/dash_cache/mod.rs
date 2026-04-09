@@ -1,4 +1,4 @@
-use crate::core::{CacheError, CacheShard, CacheStats};
+use crate::core::{CacheError, CacheStats, SlabShard};
 use ahash::AHasher;
 use futures::stream::{self, StreamExt};
 use std::hash::Hash;
@@ -8,19 +8,19 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 // wrap CacheShard in RwLock for better type semantics
-struct LockedCache<K, T> {
-    handle: RwLock<CacheShard<K, T>>,
+struct LockedCache<K: Hash + Eq, V: Clone> {
+    handle: RwLock<SlabShard<K, V>>,
 }
 
 // wrapper methods around the CacheShard shard internal to a shard
 // This level on the type abstraction contains all concurrency primitives present in the type
-impl<K, T> LockedCache<K, T>
+impl<K, V> LockedCache<K, V>
 where
     K: Hash + Eq + Clone,
-    T: Clone,
+    V: Clone,
 {
-    fn with_capacity(cap: NonZeroUsize) -> LockedCache<K, T> {
-        let cache: CacheShard<K, T> = CacheShard::with_capacity(cap);
+    fn with_capacity(cap: NonZeroUsize) -> LockedCache<K, V> {
+        let cache: SlabShard<K, V> = SlabShard::with_capacity(cap);
         let handle = RwLock::new(cache);
         LockedCache { handle }
     }
@@ -30,7 +30,7 @@ where
         guard.len()
     }
 
-    async fn insert(&self, key: K, value: T) {
+    async fn insert(&self, key: K, value: V) {
         let mut guard = self.handle.write().await;
         guard.insert(key, value)
     }
@@ -45,18 +45,18 @@ where
         guard.statistics()
     }
 
-    async fn get(&self, key: &K) -> Option<T> {
+    async fn get(&self, key: &K) -> Option<V> {
         let mut guard = self.handle.write().await;
         let value = guard.get(key);
         value
     }
 
-    async fn evict(&self, key: &K) -> Option<T> {
+    async fn evict(&self, key: &K) -> Option<V> {
         let mut guard = self.handle.write().await;
         guard.evict(key)
     }
 
-    async fn update(&self, key: &K, value: T) -> Result<(), CacheError> {
+    async fn update(&self, key: &K, value: V) -> Result<(), CacheError> {
         let mut guard = self.handle.write().await;
         guard.update(key, value)?;
         Ok(())
@@ -78,22 +78,22 @@ where
 ///This type wraps all shared internally in an tokio::sync::Arc, so wrapping this type in Arc is
 ///not required by users.
 #[derive(Clone)]
-pub struct DashCache<K, T> {
-    inner: Arc<InnerCacheShards<K, T>>,
+pub struct DashCache<K: Hash + Eq, V: Clone> {
+    inner: Arc<InnerCacheShards<K, V>>,
 }
 
-impl<K, T> DashCache<K, T>
+impl<K, V> DashCache<K, V>
 where
     K: Hash + Eq + Clone + Send + Sync + 'static,
-    T: Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
 {
     /// Use default sharding logic. By default the shard count will be equal to the number of cpu
     /// cores available on the machine. When request capacity < cpu core count, each shard
     /// will have capacity of size 1. In the case where capacity is not evenly divided by the
     /// number of cpu cores available, each shard capacity rounds up to the next unsigned integer
     /// value.
-    pub fn new(cap: NonZeroUsize) -> DashCache<K, T> {
-        let inner = Arc::new(InnerCacheShards::new(cap));
+    pub fn new(cap: NonZeroUsize) -> DashCache<K, V> {
+        let inner = Arc::new(InnerCacheShards::<K, V>::new(cap));
 
         DashCache { inner }
     }
@@ -103,7 +103,7 @@ where
     pub fn with_num_shards_and_capacity(
         num_shards: NonZeroUsize,
         shard_capacity: NonZeroUsize,
-    ) -> DashCache<K, T> {
+    ) -> DashCache<K, V> {
         let inner = Arc::new(InnerCacheShards::with_num_shards_and_capacity(
             num_shards,
             shard_capacity,
@@ -118,7 +118,7 @@ where
     /// will promote the fetched key to the most recently used in the local shard the key is stored
     /// in. This method locks the accessed shard, given the promotion semantics on a cache hit.
     /// Again, given the borrowing semantics, a clone of the value is returned.
-    pub async fn get(&self, key: &K) -> Option<T> {
+    pub async fn get(&self, key: &K) -> Option<V> {
         self.inner.get(key).await
     }
 
@@ -128,7 +128,7 @@ where
     /// locks the key local shard. This will promote the inserted/updated key to the most recently
     /// used in the local shard the key is stored in. When the cache is full, the least recently
     /// used item in the local cache is evicted.
-    pub async fn insert(&self, key: K, value: T) {
+    pub async fn insert(&self, key: K, value: V) {
         self.inner.insert(key, value).await;
     }
 
@@ -147,7 +147,7 @@ where
     }
 
     /// Pop an entry from the cache.
-    pub async fn evict(&self, key: &K) -> Option<T> {
+    pub async fn evict(&self, key: &K) -> Option<V> {
         self.inner.evict(key).await
     }
 
@@ -160,7 +160,7 @@ where
     /// value that exists in the cache. This method will not write a new key on a cache miss for a
     /// particular key, thus when the key does not exists in the cache, an error will be returned.
     /// On success a unit type value is returned.
-    pub async fn update(&self, key: &K, value: T) -> Result<(), CacheError> {
+    pub async fn update(&self, key: &K, value: V) -> Result<(), CacheError> {
         self.inner.update(key, value).await?;
         Ok(())
     }
@@ -177,22 +177,22 @@ where
 }
 
 // encapsulates the cache shards and handles all concurrent access/mutation operations
-struct InnerCacheShards<K, T> {
-    cache_shards: Box<[LockedCache<K, T>]>,
+struct InnerCacheShards<K: Hash + Eq, V: Clone> {
+    cache_shards: Box<[LockedCache<K, V>]>,
     num_shards: NonZeroUsize,
 }
 
-unsafe impl<K, T> Send for InnerCacheShards<K, T>
+unsafe impl<K, V> Send for InnerCacheShards<K, V>
 where
-    K: Send + 'static,
-    T: Send + 'static,
+    K: Hash + Eq + Send + 'static,
+    V: Clone + Send + 'static,
 {
 }
 
-unsafe impl<K, T> Sync for InnerCacheShards<K, T>
+unsafe impl<K, V> Sync for InnerCacheShards<K, V>
 where
-    K: Sync + 'static,
-    T: Sync + 'static,
+    K: Hash + Eq + Sync + 'static,
+    V: Clone + Sync + 'static,
 {
 }
 

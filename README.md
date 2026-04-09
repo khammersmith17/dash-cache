@@ -1,5 +1,10 @@
 # rust_lru_cache
-This repo is an attempt at an efficient LRU cache implementation. There are two implementations, one geared toward single threaded usage, and one geared toward performant thread safe usage. Both implementations use an internal linked list for priority, and a HashMap. The node in the linked list is owned by the HashMap in both implementations. The single threaded implementation uses weak references to determine priority and head and tail pointers, whereas the thread safe version uses NonNull pointers for list ordering and head/tail pointers in order to be Send + Sync.
+This repo is an attempt at an efficient LRU cache implementation. There are three implementations I am experimenting with, one geared toward single threaded usage, and two geared toward performant thread safe usage.
+
+All implementations use an internal linked list for priority, and a HashMap to track existence in the cache.
+The implementations in LruCache, and CacheShard are very similar, diverging in the type of pointer used. LruCache uses "safe" pointers, ie Rc<RefCell<T>>, where are the CacheShard implementation uses NonNullPointers, which introduces unsafety. The invariants that define safety within this implementation are documented in the code, and heavily asserted in debug builds.
+
+The other implementation is the most performant. IndexedCacheShard uses a contiguous allocation for the cache nodes, and maintains the least recently used list using index pointers into this slab. The HashMap holds keys and entry indexes. There is some unsafety in this implementations for performance reasons when accessing entries in the allocated slab, but this is because the invariants defined guarantee that the indexes will be valid.
 
 The thread safe implementation is dubbed DashCache, as an homage to DashMap. As such, the internal structure is a sharded LRU Cache for performant concurrent access. Shard count can be defined by the user, or defaults to the number of cpu cores available on the machine. Given the sharded nature, each key value pair priority is local to the cache shard and not a total least recently used ordering. This is of course not a characteristic of the single threaded version.
 
@@ -10,7 +15,7 @@ There are three single-threaded implementations:
 
 ## Benchmarks
 
-All times are mean latency for the full batch of operations. Benchmarks run in release mode via [Criterion](https://github.com/bheisler/criterion.rs).
+All times are mean latency for the full batch of operations. Benchmarks run in release mode via [Criterion](https://github.com/bheisler/criterion.rs). If you would like to see the raw benchmark reports, please reach out.
 
 ### Insert + Get (no eviction, 1 000 ops)
 

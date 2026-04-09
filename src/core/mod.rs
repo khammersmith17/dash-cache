@@ -819,7 +819,7 @@ where
     }
 }
 
-struct CacheSlabEntry<K: Hash + Eq + Clone, V: Clone> {
+struct CacheSlabEntry<K: Hash + Eq, V: Clone> {
     key: K,
     value: V,
     prev: Option<u32>,
@@ -831,7 +831,7 @@ struct CacheSlabEntry<K: Hash + Eq + Clone, V: Clone> {
 * Linked list pointers are indexes.
 * Node map stores an index pointer rather than a node pointer.
 * */
-pub struct IndexedCacheShard<K: Hash + Eq + Clone, V: Clone> {
+pub struct SlabShard<K: Hash + Eq, V: Clone> {
     cap: usize,
     slab: Vec<CacheSlabEntry<K, V>>,
     node_map: HashMap<K, u32>,
@@ -840,14 +840,14 @@ pub struct IndexedCacheShard<K: Hash + Eq + Clone, V: Clone> {
     stats: CacheStats,
 }
 
-impl<K, V> IndexedCacheShard<K, V>
+impl<K, V> SlabShard<K, V>
 where
     K: Hash + Eq + Clone,
     V: Clone,
 {
     /// This is the Only provided constructor.
     /// Will initialize an LruCache with the requested capacity
-    pub fn with_capacity(capacity: NonZeroUsize) -> IndexedCacheShard<K, V> {
+    pub fn with_capacity(capacity: NonZeroUsize) -> SlabShard<K, V> {
         let cap = capacity.get();
         if cap as u32 > u32::MAX {
             panic!("capacity must be <= {}", u32::MAX);
@@ -855,7 +855,7 @@ where
 
         let node_map: HashMap<K, u32> = HashMap::with_capacity(cap);
 
-        IndexedCacheShard {
+        SlabShard {
             cap,
             node_map,
             slab: Vec::with_capacity(cap),
@@ -1565,8 +1565,7 @@ mod indexed_shard_cache_test {
 
     #[test]
     fn constructs_empty() {
-        let c: IndexedCacheShard<i32, i32> =
-            IndexedCacheShard::with_capacity(NonZeroUsize::new(3).unwrap());
+        let c: SlabShard<i32, i32> = SlabShard::with_capacity(NonZeroUsize::new(3).unwrap());
         assert_eq!(c.node_map.len(), 0);
         assert!(c.head.is_none());
         assert!(c.tail.is_none());
@@ -1574,7 +1573,7 @@ mod indexed_shard_cache_test {
 
     #[test]
     fn insert_get_contains() {
-        let mut c = IndexedCacheShard::with_capacity(NonZeroUsize::new(3).unwrap());
+        let mut c = SlabShard::with_capacity(NonZeroUsize::new(3).unwrap());
         c.insert("a", 1);
         c.insert("b", 2);
         assert!(c.contains(&"a"));
@@ -1588,7 +1587,7 @@ mod indexed_shard_cache_test {
 
     #[test]
     fn get_promotes_to_head() {
-        let mut c = IndexedCacheShard::with_capacity(NonZeroUsize::new(3).unwrap());
+        let mut c = SlabShard::with_capacity(NonZeroUsize::new(3).unwrap());
         c.insert("a", 1);
         c.insert("b", 2);
         c.insert("c", 3);
@@ -1605,7 +1604,7 @@ mod indexed_shard_cache_test {
 
     #[test]
     fn update_changes_value_and_promotes() {
-        let mut c = IndexedCacheShard::with_capacity(NonZeroUsize::new(2).unwrap());
+        let mut c = SlabShard::with_capacity(NonZeroUsize::new(2).unwrap());
         c.insert("x", 10);
         c.insert("y", 20);
 
@@ -1620,7 +1619,7 @@ mod indexed_shard_cache_test {
 
     #[test]
     fn drain_empties_cache() {
-        let mut c = IndexedCacheShard::with_capacity(NonZeroUsize::new(3).unwrap());
+        let mut c = SlabShard::with_capacity(NonZeroUsize::new(3).unwrap());
         c.insert("a", 1);
         c.insert("b", 2);
         c.insert("c", 3);
@@ -1633,7 +1632,7 @@ mod indexed_shard_cache_test {
 
     #[test]
     fn many_inserts_and_accesses_preserve_invariants() {
-        let mut c = IndexedCacheShard::with_capacity(NonZeroUsize::new(5).unwrap());
+        let mut c = SlabShard::with_capacity(NonZeroUsize::new(5).unwrap());
         for i in 0..10 {
             c.insert(i, i * 10);
             assert_eq!(c.head.is_some(), c.tail.is_some());
@@ -1652,7 +1651,7 @@ mod indexed_shard_cache_test {
 
     #[test]
     fn len() {
-        let mut c = IndexedCacheShard::with_capacity(NonZeroUsize::new(3).unwrap());
+        let mut c = SlabShard::with_capacity(NonZeroUsize::new(3).unwrap());
         c.insert("a", 1);
         c.insert("b", 2);
         c.insert("c", 3);
@@ -1661,7 +1660,7 @@ mod indexed_shard_cache_test {
 
     #[test]
     fn evict() {
-        let mut c = IndexedCacheShard::with_capacity(NonZeroUsize::new(3).unwrap());
+        let mut c = SlabShard::with_capacity(NonZeroUsize::new(3).unwrap());
         c.insert("a", 1);
         c.insert("b", 2);
         c.insert("c", 3);
@@ -1674,7 +1673,7 @@ mod indexed_shard_cache_test {
 
     #[test]
     fn full_and_empty() {
-        let mut c = IndexedCacheShard::with_capacity(NonZeroUsize::new(3).unwrap());
+        let mut c = SlabShard::with_capacity(NonZeroUsize::new(3).unwrap());
         c.insert("a", 1);
         c.insert("b", 2);
         c.insert("c", 3);
@@ -1693,7 +1692,7 @@ mod indexed_shard_cache_test {
 
     #[test]
     fn insert_existing_non_head_key_non_full_updates_value() {
-        let mut c = IndexedCacheShard::with_capacity(NonZeroUsize::new(5).unwrap());
+        let mut c = SlabShard::with_capacity(NonZeroUsize::new(5).unwrap());
         c.insert(1, 10);
         c.insert(2, 20);
         c.insert(3, 30);
@@ -1707,7 +1706,7 @@ mod indexed_shard_cache_test {
 
     #[test]
     fn insert_existing_non_head_key_non_full_promotes_and_evicts_correctly() {
-        let mut c = IndexedCacheShard::with_capacity(NonZeroUsize::new(5).unwrap());
+        let mut c = SlabShard::with_capacity(NonZeroUsize::new(5).unwrap());
         c.insert(1, 10); // tail
         c.insert(2, 20);
         c.insert(3, 30); // head
@@ -1726,7 +1725,7 @@ mod indexed_shard_cache_test {
 
     #[test]
     fn insert_existing_head_key_non_full_updates_value() {
-        let mut c = IndexedCacheShard::with_capacity(NonZeroUsize::new(5).unwrap());
+        let mut c = SlabShard::with_capacity(NonZeroUsize::new(5).unwrap());
         c.insert(1, 10);
         c.insert(2, 20); // head
         // re-insert the current head — list structure must stay consistent
@@ -1738,7 +1737,7 @@ mod indexed_shard_cache_test {
 
     #[test]
     fn insert_existing_head_key_non_full_eviction_order_unchanged() {
-        let mut c = IndexedCacheShard::with_capacity(NonZeroUsize::new(5).unwrap());
+        let mut c = SlabShard::with_capacity(NonZeroUsize::new(5).unwrap());
         c.insert(1, 10); // tail
         c.insert(2, 20);
         c.insert(3, 30); // head
@@ -1753,7 +1752,7 @@ mod indexed_shard_cache_test {
 
     #[test]
     fn repeated_reinserts_non_full_maintain_integrity() {
-        let mut c = IndexedCacheShard::with_capacity(NonZeroUsize::new(10).unwrap());
+        let mut c = SlabShard::with_capacity(NonZeroUsize::new(10).unwrap());
         for i in 0..5 {
             c.insert(i, i * 10);
         }
