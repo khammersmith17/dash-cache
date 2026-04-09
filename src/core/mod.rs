@@ -826,6 +826,11 @@ struct CacheSlabEntry<K: Hash + Eq + Clone, V: Clone> {
     next: Option<u32>,
 }
 
+/*
+* Lays out all entries in a contiguous slab as opposed to Boxed.
+* Linked list pointers are indexes.
+* Node map stores an index pointer rather than a node pointer.
+* */
 pub struct IndexedCacheShard<K: Hash + Eq + Clone, V: Clone> {
     cap: usize,
     slab: Vec<CacheSlabEntry<K, V>>,
@@ -871,8 +876,9 @@ where
     }
 
     /// Safety: This method should only be called when the cache is non empty, ie when there is an
-    /// entry in the cache to update. A ptr needs to be available. The ptr provided is from a cache
-    /// entry, dictating that the cache is not empty, thus head should be Some.
+    /// entry in the cache to update. An entry needs to be available. The entry provided is from a cache
+    /// entry that is obtain in an upstream method, dictating that the cache is not empty,
+    /// thus head should be Some.
     /// Debug assertion validates that behavior.
     #[inline(always)]
     fn update_cache_entry(&mut self, entry_idx: u32, value: V) {

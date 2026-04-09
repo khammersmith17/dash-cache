@@ -7,5 +7,5 @@ pub mod dash_cache;
 /// DashCache as an homage. All mutation is done internally, and thus not get_mut type methods are
 /// exposed to optimize concurrent and shared access, thus there is some overhead paid for cloning
 /// data on get and set type methods.
-pub use core::{CacheShard, LruCache};
+pub use core::{CacheShard, IndexedCacheShard, LruCache};
 pub use dash_cache::DashCache;

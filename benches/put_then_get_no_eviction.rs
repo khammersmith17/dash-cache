@@ -62,7 +62,7 @@ fn bench_insert_get_sync_lru_bench(c: &mut Criterion) {
     group.finish();
 }
 
-use dash_cache::core::CacheShard;
+use dash_cache::core::{CacheShard, IndexedCacheShard};
 fn bench_insert_get_sync_single_threaded_shard(c: &mut Criterion) {
     let mut group = c.benchmark_group("single_threaded_shard");
     for &cap in &[1_000usize, 10_000] {
@@ -78,6 +78,33 @@ fn bench_insert_get_sync_single_threaded_shard(c: &mut Criterion) {
                 },
                 |(mut cache, keys)| {
                     // measure
+                    for k in &keys {
+                        cache.insert(*k, *k);
+                    }
+                    for k in &keys {
+                        let _ = black_box(cache.get(k));
+                    }
+                },
+                BatchSize::SmallInput,
+            )
+        });
+    }
+    group.finish();
+}
+
+fn bench_insert_get_sync_indexed_shard(c: &mut Criterion) {
+    let mut group = c.benchmark_group("indexed_shard");
+    for &cap in &[1_000usize, 10_000] {
+        group.throughput(Throughput::Elements(1_000));
+        group.bench_function(format!("insert_then_get_cap={}", cap), |b| {
+            b.iter_batched(
+                || {
+                    let cache = IndexedCacheShard::with_capacity(NonZeroUsize::new(cap).unwrap());
+                    let mut rng = StdRng::seed_from_u64(42);
+                    let keys: Vec<u64> = (0..1_000).map(|_| rng.r#gen()).collect();
+                    (cache, keys)
+                },
+                |(mut cache, keys)| {
                     for k in &keys {
                         cache.insert(*k, *k);
                     }
@@ -147,6 +174,62 @@ fn bench_get_hit_only_lru_crate(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_get_hit_only_indexed_shard(c: &mut Criterion) {
+    let mut group = c.benchmark_group("indexed_shard_get_hit_only");
+    for &n in &[1_000usize, 10_000] {
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_function(format!("n={}", n), |b| {
+            b.iter_batched(
+                || {
+                    let mut cache =
+                        IndexedCacheShard::with_capacity(NonZeroUsize::new(n).unwrap());
+                    let mut rng = StdRng::seed_from_u64(42);
+                    let keys: Vec<u64> = (0..n).map(|_| rng.r#gen()).collect();
+                    for &k in &keys {
+                        cache.insert(k, k);
+                    }
+                    (cache, keys)
+                },
+                |(mut cache, keys)| {
+                    for k in &keys {
+                        let _ = black_box(cache.get(k));
+                    }
+                },
+                BatchSize::SmallInput,
+            )
+        });
+    }
+    group.finish();
+}
+
+fn bench_insert_existing_non_full_indexed_shard(c: &mut Criterion) {
+    let mut group = c.benchmark_group("indexed_shard_insert_existing_non_full");
+    for &n in &[1_000usize, 10_000] {
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_function(format!("n={}", n), |b| {
+            b.iter_batched(
+                || {
+                    let mut cache =
+                        IndexedCacheShard::with_capacity(NonZeroUsize::new(n * 2).unwrap());
+                    let mut rng = StdRng::seed_from_u64(42);
+                    let keys: Vec<u64> = (0..n).map(|_| rng.r#gen()).collect();
+                    for &k in &keys {
+                        cache.insert(k, k);
+                    }
+                    (cache, keys)
+                },
+                |(mut cache, keys)| {
+                    for k in &keys {
+                        cache.insert(*k, *k);
+                    }
+                },
+                BatchSize::SmallInput,
+            )
+        });
+    }
+    group.finish();
+}
+
 // All inserts hit existing keys in a non-full cache — exercises the Entry API
 // Occupied branch exclusively. Compared against insert-then-get to show the cost
 // of promotion without allocation.
@@ -193,11 +276,21 @@ criterion_group!(
     bench_insert_existing_non_full_shard
 );
 
+criterion_group!(indexed_shard_comp, bench_insert_get_sync_indexed_shard);
+criterion_group!(indexed_shard_get_hit_only, bench_get_hit_only_indexed_shard);
+criterion_group!(
+    indexed_shard_insert_existing_non_full,
+    bench_insert_existing_non_full_indexed_shard
+);
+
 criterion_main!(
     sync,
     lru_crate_bench_comp,
     single_threaded_shard_comp,
     shard_get_hit_only,
     lru_crate_get_hit_only,
-    shard_insert_existing_non_full
+    shard_insert_existing_non_full,
+    indexed_shard_comp,
+    indexed_shard_get_hit_only,
+    indexed_shard_insert_existing_non_full
 );
