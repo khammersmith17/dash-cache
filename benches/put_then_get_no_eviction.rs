@@ -62,7 +62,7 @@ fn bench_insert_get_sync_lru_bench(c: &mut Criterion) {
     group.finish();
 }
 
-use dash_cache::core::{CacheShard, IndexedCacheShard};
+use dash_cache::core::{CacheShard, SlabShard};
 fn bench_insert_get_sync_single_threaded_shard(c: &mut Criterion) {
     let mut group = c.benchmark_group("single_threaded_shard");
     for &cap in &[1_000usize, 10_000] {
@@ -99,7 +99,7 @@ fn bench_insert_get_sync_indexed_shard(c: &mut Criterion) {
         group.bench_function(format!("insert_then_get_cap={}", cap), |b| {
             b.iter_batched(
                 || {
-                    let cache = IndexedCacheShard::with_capacity(NonZeroUsize::new(cap).unwrap());
+                    let cache = SlabShard::with_capacity(NonZeroUsize::new(cap).unwrap());
                     let mut rng = StdRng::seed_from_u64(42);
                     let keys: Vec<u64> = (0..1_000).map(|_| rng.r#gen()).collect();
                     (cache, keys)
@@ -181,8 +181,7 @@ fn bench_get_hit_only_indexed_shard(c: &mut Criterion) {
         group.bench_function(format!("n={}", n), |b| {
             b.iter_batched(
                 || {
-                    let mut cache =
-                        IndexedCacheShard::with_capacity(NonZeroUsize::new(n).unwrap());
+                    let mut cache = SlabShard::with_capacity(NonZeroUsize::new(n).unwrap());
                     let mut rng = StdRng::seed_from_u64(42);
                     let keys: Vec<u64> = (0..n).map(|_| rng.r#gen()).collect();
                     for &k in &keys {
@@ -209,8 +208,7 @@ fn bench_insert_existing_non_full_indexed_shard(c: &mut Criterion) {
         group.bench_function(format!("n={}", n), |b| {
             b.iter_batched(
                 || {
-                    let mut cache =
-                        IndexedCacheShard::with_capacity(NonZeroUsize::new(n * 2).unwrap());
+                    let mut cache = SlabShard::with_capacity(NonZeroUsize::new(n * 2).unwrap());
                     let mut rng = StdRng::seed_from_u64(42);
                     let keys: Vec<u64> = (0..n).map(|_| rng.r#gen()).collect();
                     for &k in &keys {
@@ -242,8 +240,7 @@ fn bench_insert_existing_non_full_shard(c: &mut Criterion) {
                 || {
                     // cap = 2*n keeps the cache non-full throughout, so all
                     // re-inserts go through the Entry Occupied branch
-                    let mut cache =
-                        CacheShard::with_capacity(NonZeroUsize::new(n * 2).unwrap());
+                    let mut cache = CacheShard::with_capacity(NonZeroUsize::new(n * 2).unwrap());
                     let mut rng = StdRng::seed_from_u64(42);
                     let keys: Vec<u64> = (0..n).map(|_| rng.r#gen()).collect();
                     for &k in &keys {

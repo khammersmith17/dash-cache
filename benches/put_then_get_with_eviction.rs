@@ -63,7 +63,7 @@ fn bench_insert_with_eviction_crate_bench(c: &mut Criterion) {
     group.finish();
 }
 
-use dash_cache::core::{CacheShard, IndexedCacheShard};
+use dash_cache::core::{CacheShard, SlabShard};
 
 fn bench_insert_with_eviction_shard(c: &mut Criterion) {
     let mut group = c.benchmark_group("single_threaded_shard");
@@ -151,7 +151,7 @@ fn bench_insert_with_eviction_indexed_shard(c: &mut Criterion) {
         group.bench_function(format!("insert_with_eviction={}", cap), |b| {
             b.iter_batched(
                 || {
-                    let cache = IndexedCacheShard::with_capacity(NonZeroUsize::new(cap).unwrap());
+                    let cache = SlabShard::with_capacity(NonZeroUsize::new(cap).unwrap());
                     let mut rng = StdRng::seed_from_u64(42);
                     let keys: Vec<u64> = (0..10_000).map(|_| rng.r#gen()).collect();
                     (cache, keys)
@@ -178,7 +178,7 @@ fn bench_insert_only_eviction_indexed_shard(c: &mut Criterion) {
         group.bench_function(format!("cap={}", cap), |b| {
             b.iter_batched(
                 || {
-                    let cache = IndexedCacheShard::with_capacity(NonZeroUsize::new(cap).unwrap());
+                    let cache = SlabShard::with_capacity(NonZeroUsize::new(cap).unwrap());
                     let mut rng = StdRng::seed_from_u64(42);
                     let keys: Vec<u64> = (0..10_000).map(|_| rng.r#gen()).collect();
                     (cache, keys)
@@ -204,8 +204,7 @@ fn bench_insert_existing_key_full_indexed_shard(c: &mut Criterion) {
         group.bench_function(format!("n={}", n), |b| {
             b.iter_batched(
                 || {
-                    let mut cache =
-                        IndexedCacheShard::with_capacity(NonZeroUsize::new(n).unwrap());
+                    let mut cache = SlabShard::with_capacity(NonZeroUsize::new(n).unwrap());
                     let mut rng = StdRng::seed_from_u64(42);
                     let keys: Vec<u64> = (0..n).map(|_| rng.r#gen()).collect();
                     for &k in &keys {
