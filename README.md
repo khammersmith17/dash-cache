@@ -1,4 +1,4 @@
-# rust_lru_cache
+# dash-cache
 This repo is an attempt at an efficient LRU cache implementation. There are three implementations I am experimenting with, one geared toward single threaded usage, and two geared toward performant thread safe usage.
 
 All implementations use an internal linked list for priority, and a HashMap to track existence in the cache.
@@ -12,7 +12,7 @@ The internal implementation for the shards in DashCache, is the SlabShard
 
 There are three single-threaded implementations:
 - **LruCache** — safe, single-threaded, uses `Rc<RefCell<>>` for linked list nodes
-- **CacheShard** — unsafe, uses `NonNull` raw pointers and `Box`-heap-allocated nodes; the internal shard type for `DashCache`
+- **CacheShard** — unsafe, uses `NonNull` raw pointers and `Box`-rallocated nodes; the internal shard type for `DashCache`
 - **SlabShard** — unsafe, uses a contiguous slab (`Vec`) with `u32` index pointers for improved cache locality
 
 ## Benchmarks
