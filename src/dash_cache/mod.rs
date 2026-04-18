@@ -75,6 +75,18 @@ where
     }
 }
 
+/// Builder for [`DashCache`].
+///
+/// Construct one via [`DashCacheBuilder::new`], optionally set [`with_num_shards`] and/or
+/// [`with_hasher`], then call [`build`] to obtain a [`DashCache`].
+///
+/// If `with_num_shards` is not called, the cache defaults to one shard per logical CPU core and
+/// distributes `capacity` evenly across them (ceiling division). If `with_hasher` is not called,
+/// `ahash::RandomState` is used.
+///
+/// [`with_num_shards`]: DashCacheBuilder::with_num_shards
+/// [`with_hasher`]: DashCacheBuilder::with_hasher
+/// [`build`]: DashCacheBuilder::build
 pub struct DashCacheBuilder<K, V, S = ahash::RandomState>
 where
     K: Hash + Ord + Clone + Send + Sync + 'static,
@@ -92,6 +104,10 @@ where
     K: Hash + Ord + Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
 {
+    /// Creates a builder with the given total capacity and `ahash::RandomState` as the default
+    /// hasher. Call [`with_num_shards`](DashCacheBuilder::with_num_shards) and/or
+    /// [`with_hasher`](DashCacheBuilder::with_hasher) to customise, then
+    /// [`build`](DashCacheBuilder::build) to construct the cache.
     pub fn new(capacity: NonZeroUsize) -> DashCacheBuilder<K, V> {
         DashCacheBuilder {
             cap: capacity,
@@ -108,11 +124,19 @@ where
     V: Clone + Send + Sync + 'static,
     S: BuildHasher + Clone,
 {
+    /// Sets the number of shards. Per-shard capacity is computed as `ceil(total_cap / num_shards)`
+    /// when [`build`](DashCacheBuilder::build) is called, so total capacity may be slightly above
+    /// the value passed to [`new`](DashCacheBuilder::new) when it is not evenly divisible.
     pub fn with_num_shards(mut self, num_shards: NonZeroUsize) -> DashCacheBuilder<K, V, S> {
         self.num_shards = Some(num_shards);
         self
     }
 
+    /// Replaces the hasher, retyping the builder. Any state set before this call (capacity,
+    /// num_shards) is preserved. Because this changes the `S` type parameter, the returned builder
+    /// is `DashCacheBuilder<K, V, H>` rather than `DashCacheBuilder<K, V, S>`.
+    ///
+    /// The hasher must implement `Clone` because each shard receives its own clone of the state.
     pub fn with_hasher<H: BuildHasher + Clone>(self, hasher: H) -> DashCacheBuilder<K, V, H> {
         let DashCacheBuilder {
             cap, num_shards, ..
@@ -125,6 +149,11 @@ where
         }
     }
 
+    /// Consumes the builder and returns a [`DashCache`].
+    ///
+    /// If [`with_num_shards`](DashCacheBuilder::with_num_shards) was called, the cache has exactly
+    /// that many shards, each with capacity `ceil(total_cap / num_shards)`. Otherwise, the number
+    /// of shards defaults to the number of logical CPU cores.
     pub fn build(self) -> DashCache<K, V, S> {
         let DashCacheBuilder {
             cap,
