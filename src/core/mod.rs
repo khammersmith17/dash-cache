@@ -1,8 +1,8 @@
-use ahash::{HashMap, HashMapExt};
 use core::ptr::NonNull;
 use std::cell::{RefCell, RefMut};
+use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::hash::Hash;
+use std::hash::{BuildHasher, Hash};
 use std::num::NonZeroUsize;
 use std::rc::{Rc, Weak};
 use thiserror::Error;
@@ -68,14 +68,15 @@ struct CacheEntry<K, T> {
     next: Option<Weak<RefCell<CacheEntry<K, T>>>>,
 }
 
-/// LruCache is desgined for single threaded access or to be used in a non async context, this type
-/// is not Send + Sync.
-/// Initializing with capacity is required.
-/// When the cache is full, the least recently used item will be evicted.
-/// A use is defined as a write to the cache or a read from the cache. This type is fully safe.
-/// Performance in debug mode may not be optimal, due to the internal variant assertions to ensure
-/// correct behavior. All data accesses return copies due to internal borrowing mechanics.
-/// Hopefully this can be improved in later versions.
+/// A single-threaded LRU cache. Not `Send` or `Sync` — use `DashCache` for concurrent access.
+///
+/// Internally uses `Rc<RefCell<T>>` for linked list nodes, making this a fully safe implementation.
+/// A "use" is defined as any read or write — both promote the key to most recently used.
+/// When the cache is full, the least recently used item is evicted on the next insert.
+/// All values returned are clones due to the internal borrowing mechanics of `RefCell`.
+///
+/// Debug builds run invariant assertions on every operation. Release performance is good but
+/// slower than `CacheShard` or `SlabShard` due to reference counting overhead.
 #[derive(Debug)]
 pub struct LruCache<K, T> {
     cap: usize,
@@ -90,8 +91,7 @@ where
     K: Hash + Eq + Clone + std::fmt::Debug,
     T: Clone + std::fmt::Debug,
 {
-    /// This is the only provided constructor.
-    /// Will initialize an LruCache with the requested capacity
+    /// Creates a new `LruCache` with the given capacity.
     pub fn with_capacity(capacity: NonZeroUsize) -> LruCache<K, T> {
         let cap = capacity.get();
         let node_map: HashMap<K, Rc<RefCell<CacheEntry<K, T>>>> = HashMap::with_capacity(cap);
@@ -113,8 +113,8 @@ where
         self.node_map.len()
     }
 
-    /// Get a refernce to the key that is currently the most recently used entry in the cache, which is
-    /// also the head.
+    /// Returns a clone of the key at the head of the recency list (most recently used entry),
+    /// or `None` if the cache is empty.
     pub fn head(&self) -> Option<K> {
         match self.head {
             Some(ref weak_head) => {
@@ -128,7 +128,8 @@ where
         }
     }
 
-    /// Pop the least recently used entry in the cache.
+    /// Removes the entry for the given key from the cache and returns its value, or `None` if the
+    /// key is not present. Does not count as a miss in statistics.
     pub fn evict(&mut self, key: &K) -> Option<T> {
         let Some(cache_entry) = self.node_map.remove(key) else {
             return None;
@@ -156,25 +157,21 @@ where
         Some(value)
     }
 
-    /// Cache hits, misses, and evictions are stored internally. This method exposes a snapshot of
-    /// the current cache locality performance.
+    /// Returns a snapshot of cache hit, miss, and eviction counts.
     pub fn statistics(&self) -> CacheStats {
         self.stats.clone()
     }
 
-    /// Returns whether or not a key exists in the cache.
-    /// This method is not defined as a use, thus accessing this key will not promote the item.
+    /// Returns `true` if the key exists in the cache without promoting it or recording a hit.
     pub fn contains(&self, key: &K) -> bool {
         self.node_map.contains_key(key)
     }
 
-    /// Update an item that exists in the cache.
-    /// If the requested key does not exist in the cache, a CacheError will be returned.
-    /// On success, a unit type value is returned.
-    /// When the value of a key value pair is updated, this key value pair is promoted to most
-    /// recently used. There is no get_mut method on this type due to borrowing semantic
-    /// limitations, use this method any time you would like to mutate the value stored with a
-    /// given key.
+    /// Updates the value for an existing key and promotes it to most recently used.
+    ///
+    /// Returns `Err(CacheError::KeyNotExist)` if the key is not in the cache. Use `insert` to
+    /// write a new key. There is no `get_mut` — this is the correct method for mutating a stored
+    /// value.
     pub fn update(&mut self, key: &K, value: T) -> Result<(), CacheError> {
         #[cfg(debug_assertions)]
         {
@@ -204,23 +201,21 @@ where
         Ok(())
     }
 
-    /// Returns whether the cache is empty or not. Empty is defined as both head and tail of the internal linked list are
-    /// None and the internal entry table is empty. The valid variants are that both are true or
-    /// neither is true.
+    /// Returns `true` if the cache contains no entries.
     pub fn is_empty(&self) -> bool {
         self.head.is_none() && self.tail.is_none() && self.len() == 0
     }
 
-    /// Returns whether or not the cache is at capacity. When the cache is at capacity, the next
-    /// insert into the cache will lead to eviction.
+    /// Returns `true` if the cache is at capacity. The next insert of a new key will evict the
+    /// least recently used entry.
     pub fn is_full(&self) -> bool {
         self.len() == self.cap
     }
 
-    /// Insert value into the cache.
-    /// If the key currently exists in the cache, the associated value is updated.
-    /// Key value pair is either promoted to most recently used if it exists, or inserted as most
-    /// recently used.
+    /// Inserts a key-value pair into the cache.
+    ///
+    /// If the key already exists, its value is updated and it is promoted to most recently used.
+    /// If the cache is full and the key is new, the least recently used entry is evicted first.
     pub fn insert(&mut self, key: K, value: T) {
         #[cfg(debug_assertions)]
         {
@@ -416,9 +411,9 @@ where
         self.node_map.remove(&curr_tail_rc.as_ref().borrow().key);
     }
 
-    /// Fetch value from the cache for associated key.
-    /// Key value pair will then be promoted to most recently used.
-    /// When they Key does not exist in the cache, None will be returned.
+    /// Returns a clone of the value for the given key and promotes it to most recently used.
+    ///
+    /// Returns `None` on a cache miss.
     pub fn get(&mut self, key: &K) -> Option<T> {
         #[cfg(debug_assertions)]
         {
@@ -453,8 +448,8 @@ where
     }
 }
 
-// internal cache table entry for safely sharing across threads
-// leveraging NonNull safe pointers rather than
+// Internal linked list node for CacheShard. Uses NonNull raw pointers for prev/next to avoid
+// the reference-counting overhead of Rc, at the cost of requiring manual safety invariants.
 #[derive(Clone)]
 struct ShardCacheEntry<K, T> {
     key: K,
@@ -463,42 +458,49 @@ struct ShardCacheEntry<K, T> {
     prev: Option<NonNull<ShardCacheEntry<K, T>>>,
 }
 
-/// This is unsafe implementation of an LRU Cache, and it the cache type used in the shards of the
-/// 'DashCache' type. Debug performance is non-optimal. Given the unsafe nature, invariant
-/// assertions are run on every cache operation to maintain correct state. In release builds, the
-/// performance is quite good, consist with other crates such as lru.
-/// Hopefully this can be improved in later versions.
-pub struct CacheShard<K, T> {
+/// An unsafe, single-threaded LRU cache using `NonNull` raw pointers and `Box`-heap-allocated
+/// nodes for the recency list.
+///
+/// Safety invariants are documented inline and heavily asserted in debug builds. Release builds
+/// skip these checks and perform consistently with comparable crates such as `lru`.
+///
+/// This type is `Send + Sync` and was the original internal shard type for `DashCache`. It has
+/// since been superseded by `SlabShard` for better cache locality, but is retained as a
+/// standalone cache type.
+pub struct CacheShard<K, T, S = ahash::RandomState>
+where
+    K: Hash + Eq + Clone,
+    T: Clone,
+    S: BuildHasher,
+{
     cap: usize,
-    node_map: HashMap<K, Box<ShardCacheEntry<K, T>>>,
+    node_map: HashMap<K, Box<ShardCacheEntry<K, T>>, S>,
     head: Option<NonNull<ShardCacheEntry<K, T>>>,
     tail: Option<NonNull<ShardCacheEntry<K, T>>>,
     stats: CacheStats,
 }
 
-unsafe impl<K, T> Send for CacheShard<K, T>
+impl<K, T> CacheShard<K, T, ahash::RandomState>
 where
-    K: Send + 'static,
-    T: Send + 'static,
+    K: Hash + Ord + Clone,
+    T: Clone,
 {
-}
-unsafe impl<K, T> Sync for CacheShard<K, T>
-where
-    K: Sync + 'static,
-    T: Sync + 'static,
-{
+    pub fn with_capacity(capacity: NonZeroUsize) -> CacheShard<K, T, ahash::RandomState> {
+        CacheShard::with_capacity_and_hasher(capacity, ahash::RandomState::new())
+    }
 }
 
-impl<K, T> CacheShard<K, T>
+impl<K, T, S> CacheShard<K, T, S>
 where
     K: Hash + Eq + Clone,
     T: Clone,
+    S: BuildHasher,
 {
-    /// This is the Only provided constructor.
-    /// Will initialize an LruCache with the requested capacity
-    pub fn with_capacity(capacity: NonZeroUsize) -> CacheShard<K, T> {
+    /// Creates a new `CacheShard` with the given capacity.
+    pub fn with_capacity_and_hasher(capacity: NonZeroUsize, hasher: S) -> CacheShard<K, T, S> {
         let cap = capacity.get();
-        let node_map: HashMap<K, Box<ShardCacheEntry<K, T>>> = HashMap::with_capacity(cap);
+        let node_map: HashMap<K, Box<ShardCacheEntry<K, T>>, S> =
+            HashMap::with_capacity_and_hasher(cap, hasher);
 
         CacheShard {
             cap,
@@ -509,20 +511,19 @@ where
         }
     }
 
-    /// Returns whether or not a key exists in the cache.
-    /// This method is not defined as a use, thus accessing this key will not promote the item.
+    /// Returns `true` if the key exists in the cache without promoting it or recording a hit.
     pub fn contains(&self, key: &K) -> bool {
         self.node_map.contains_key(key)
     }
 
+    /// Returns the number of entries currently in the cache.
     pub fn len(&self) -> usize {
         self.node_map.len()
     }
 
-    /// Safety: This method should only be called when the cache is non empty, ie when there is an
-    /// entry in the cache to update. A ptr needs to be available. The ptr provided is from a cache
-    /// entry, dictating that the cache is not empty, thus head should be Some.
-    /// Debug assertion validates that behavior.
+    // Promotes the entry at `entry_ptr` to the head of the recency list and overwrites its value.
+    // Safety: must only be called with a pointer obtained from a live entry in `node_map`.
+    // The cache must be non-empty when this is called (debug-asserted).
     #[inline(always)]
     fn update_cache_entry(&mut self, mut entry_ptr: NonNull<ShardCacheEntry<K, T>>, value: T) {
         debug_assert!(self.head.is_some());
@@ -537,13 +538,11 @@ where
         unsafe { entry_ptr.as_mut().value = value };
     }
 
-    /// Update an item that exists in the cache.
-    /// If the requested key does not exist in the cache, a CacheError will be returned.
-    /// On success, a unit type value is returned.
-    /// When the value of a key value pair is updated, this key value pair is promoted to most
-    /// recently used. There is no get_mut method on this type due to borrowing semantic
-    /// limitations, use this method any time you would like to mutate the value stored with a
-    /// given key.
+    /// Updates the value for an existing key and promotes it to most recently used.
+    ///
+    /// Returns `Err(CacheError::KeyNotExist)` if the key is not in the cache. Use `insert` to
+    /// write a new key. There is no `get_mut` — this is the correct method for mutating a stored
+    /// value.
     pub fn update(&mut self, key: &K, value: T) -> Result<(), CacheError> {
         debug_assert!(
             (self.head.is_some() && self.tail.is_some())
@@ -563,8 +562,8 @@ where
         Ok(())
     }
 
-    /// Pop an entry from the cache, forcing an eviction. Returns the value associated with the key
-    /// is the key is currently in the cache, None otherwise.
+    /// Removes the entry for the given key and returns its value, or `None` if the key is not
+    /// present. Does not count as a miss in statistics.
     pub fn evict(&mut self, key: &K) -> Option<T> {
         let Some(mut cache_entry) = self.node_map.remove(key) else {
             return None;
@@ -586,35 +585,23 @@ where
         Some(value)
     }
 
-    /// Returns whether or not the cache is currently empty. Empty is defined as both head and tail are None and the internal
-    /// entry table is empty.
+    /// Returns `true` if the cache contains no entries.
     #[allow(unused)]
     pub fn is_empty(&self) -> bool {
         self.head.is_none() && self.tail.is_none() && self.len() == 0
     }
 
-    /// Returns whether the cache is full. When the cache is full, the next insert will force an
-    /// eviction.
+    /// Returns `true` if the cache is at capacity. The next insert of a new key will evict the
+    /// least recently used entry.
     pub fn is_full(&self) -> bool {
         self.node_map.len() == self.cap
     }
 
-    /// Insert value into the cache.
-    /// If the key currently exists in the cache, the value is updated
-    /// Key value pair is promoted to most recently used.
-    /*
-     * Implementation.
-     * - When cache is saturated
-     *   - when insert key is a cache hit, update the value
-     *   - Otherwise, reuse evicted entry memory allocation, and overwrite with new entry
-     * - Otherwise:
-     *   - Use entry api to avoid double lookup
-     *   - if enrty is occupied, get the entry and use update api
-     *   - otherwise, allocate and init a new entry
-     *
-     * Note: head promotion is handled in update method. Paths that lead to node update do not
-     * promoted the entry to the head.
-     * */
+    /// Inserts a key-value pair into the cache.
+    ///
+    /// If the key already exists, its value is updated and it is promoted to most recently used.
+    /// If the cache is full and the key is new, the least recently used entry is evicted and its
+    /// `Box` allocation is reused for the new entry to avoid an extra allocation.
     pub fn insert(&mut self, key: K, value: T) {
         let ptr = if self.is_full() {
             match self.node_map.get(&key) {
@@ -779,9 +766,9 @@ where
         unsafe { self.node_map.remove(&tail_ptr.as_ref().key).unwrap() }
     }
 
-    /// Fetch value from the cache for associated key.
-    /// Key value pair will then be promoted to most recently used.
-    /// When they Key does not exist in the cache, None will be returned.
+    /// Returns a clone of the value for the given key and promotes it to most recently used.
+    ///
+    /// Returns `None` on a cache miss.
     pub fn get(&mut self, key: &K) -> Option<T> {
         let entry_ptr = {
             let Some(entry_box) = self.node_map.get(key) else {
@@ -812,8 +799,7 @@ where
         Some(value)
     }
 
-    /// Statistics are kept internally detailing the number of cache hits, misses, and evictions
-    /// for promoting operations.
+    /// Returns a snapshot of cache hit, miss, and eviction counts.
     pub fn statistics(&self) -> CacheStats {
         self.stats.clone()
     }
@@ -826,34 +812,54 @@ struct CacheSlabEntry<K: Hash + Eq, V: Clone> {
     next: Option<u32>,
 }
 
-/*
-* Lays out all entries in a contiguous slab as opposed to Boxed.
-* Linked list pointers are indexes.
-* Node map stores an index pointer rather than a node pointer.
-* */
-pub struct SlabShard<K: Hash + Eq, V: Clone> {
+/// An unsafe, single-threaded LRU cache backed by a contiguous slab allocation.
+///
+/// Unlike `CacheShard`, all entries live in a pre-allocated `Vec` and the recency list uses `u32`
+/// slab indices instead of heap pointers. This gives significantly better cache locality,
+/// especially on read-heavy workloads.
+///
+/// This is `Send + Sync` and is the internal shard type used by `DashCache`.
+///
+/// Safety invariants are documented inline and heavily asserted in debug builds. Capacity is
+/// limited to `u32::MAX` entries. All values returned are clones.
+pub struct SlabShard<K, V, S = ahash::RandomState>
+where
+    K: Hash + Ord + Clone,
+    V: Clone,
+    S: BuildHasher,
+{
     cap: usize,
     slab: Vec<CacheSlabEntry<K, V>>,
-    node_map: HashMap<K, u32>,
+    node_map: HashMap<K, u32, S>,
     head: Option<u32>,
     tail: Option<u32>,
     stats: CacheStats,
 }
 
-impl<K, V> SlabShard<K, V>
+impl<K, V> SlabShard<K, V, ahash::RandomState>
 where
-    K: Hash + Eq + Clone,
+    K: Hash + Ord + Clone,
     V: Clone,
 {
-    /// This is the Only provided constructor.
-    /// Will initialize an LruCache with the requested capacity
-    pub fn with_capacity(capacity: NonZeroUsize) -> SlabShard<K, V> {
+    pub fn with_capacity(capacity: NonZeroUsize) -> SlabShard<K, V, ahash::RandomState> {
+        SlabShard::with_capacity_and_hasher(capacity, ahash::RandomState::new())
+    }
+}
+
+impl<K, V, S> SlabShard<K, V, S>
+where
+    K: Hash + Ord + Clone,
+    V: Clone,
+    S: BuildHasher,
+{
+    /// Creates a new `SlabShard` with the given capacity. Panics if capacity exceeds `u32::MAX`.
+    pub fn with_capacity_and_hasher(capacity: NonZeroUsize, hasher: S) -> SlabShard<K, V, S> {
         let cap = capacity.get();
         if cap as u32 > u32::MAX {
             panic!("capacity must be <= {}", u32::MAX);
         }
 
-        let node_map: HashMap<K, u32> = HashMap::with_capacity(cap);
+        let node_map: HashMap<K, u32, S> = HashMap::with_capacity_and_hasher(cap, hasher);
 
         SlabShard {
             cap,
@@ -865,21 +871,19 @@ where
         }
     }
 
-    /// Returns whether or not a key exists in the cache.
-    /// This method is not defined as a use, thus accessing this key will not promote the item.
+    /// Returns `true` if the key exists in the cache without promoting it or recording a hit.
     pub fn contains(&self, key: &K) -> bool {
         self.node_map.contains_key(key)
     }
 
+    /// Returns the number of entries currently in the cache.
     pub fn len(&self) -> usize {
         self.slab.len()
     }
 
-    /// Safety: This method should only be called when the cache is non empty, ie when there is an
-    /// entry in the cache to update. An entry needs to be available. The entry provided is from a cache
-    /// entry that is obtain in an upstream method, dictating that the cache is not empty,
-    /// thus head should be Some.
-    /// Debug assertion validates that behavior.
+    // Promotes the entry at `entry_idx` to the head of the recency list and overwrites its value.
+    // Safety: `entry_idx` must be a valid index into `self.slab`, obtained from `node_map`.
+    // The cache must be non-empty when this is called (debug-asserted).
     #[inline(always)]
     fn update_cache_entry(&mut self, entry_idx: u32, value: V) {
         debug_assert!(self.head.is_some());
@@ -894,13 +898,11 @@ where
         unsafe { self.slab.get_unchecked_mut(entry_idx as usize).value = value };
     }
 
-    /// Update an item that exists in the cache.
-    /// If the requested key does not exist in the cache, a CacheError will be returned.
-    /// On success, a unit type value is returned.
-    /// When the value of a key value pair is updated, this key value pair is promoted to most
-    /// recently used. There is no get_mut method on this type due to borrowing semantic
-    /// limitations, use this method any time you would like to mutate the value stored with a
-    /// given key.
+    /// Updates the value for an existing key and promotes it to most recently used.
+    ///
+    /// Returns `Err(CacheError::KeyNotExist)` if the key is not in the cache. Use `insert` to
+    /// write a new key. There is no `get_mut` — this is the correct method for mutating a stored
+    /// value.
     pub fn update(&mut self, key: &K, value: V) -> Result<(), CacheError> {
         debug_assert!(
             (self.head.is_some() && self.tail.is_some())
@@ -915,8 +917,11 @@ where
         Ok(())
     }
 
-    /// Pop an entry from the cache, forcing an eviction. Returns the value associated with the key
-    /// is the key is currently in the cache, None otherwise.
+    /// Removes the entry for the given key and returns its value, or `None` if the key is not
+    /// present. Does not count as a miss in statistics.
+    ///
+    /// Uses `swap_remove` internally: the last slab entry is moved into the evicted slot, and all
+    /// index references to it (in `node_map` and the recency list) are updated accordingly.
     pub fn evict(&mut self, key: &K) -> Option<V> {
         let Some(entry_idx) = self.node_map.remove(key) else {
             return None;
@@ -956,35 +961,23 @@ where
         Some(value)
     }
 
-    /// Returns whether or not the cache is currently empty. Empty is defined as both head and tail are None and the internal
-    /// entry table is empty.
+    /// Returns `true` if the cache contains no entries.
     #[allow(unused)]
     pub fn is_empty(&self) -> bool {
         self.head.is_none() && self.tail.is_none() && self.len() == 0
     }
 
-    /// Returns whether the cache is full. When the cache is full, the next insert will force an
-    /// eviction.
+    /// Returns `true` if the cache is at capacity. The next insert of a new key will evict the
+    /// least recently used entry.
     pub fn is_full(&self) -> bool {
         self.node_map.len() == self.cap
     }
 
-    /// Insert value into the cache.
-    /// If the key currently exists in the cache, the value is updated
-    /// Key value pair is promoted to most recently used.
-    /*
-     * Implementation.
-     * - When cache is saturated
-     *   - when insert key is a cache hit, update the value
-     *   - Otherwise, reuse evicted entry memory allocation, and overwrite with new entry
-     * - Otherwise:
-     *   - Use entry api to avoid double lookup
-     *   - if enrty is occupied, get the entry and use update api
-     *   - otherwise, allocate and init a new entry
-     *
-     * Note: head promotion is handled in update method. Paths that lead to node update do not
-     * promoted the entry to the head.
-     * */
+    /// Inserts a key-value pair into the cache.
+    ///
+    /// If the key already exists, its value is updated and it is promoted to most recently used.
+    /// If the cache is full and the key is new, the least recently used entry is evicted and its
+    /// slab slot is reused in-place for the new entry — no allocation or deallocation occurs.
     pub fn insert(&mut self, key: K, value: V) {
         let idx = if self.is_full() {
             match self.node_map.get(&key) {
@@ -1035,6 +1028,7 @@ where
         self.head = None;
         self.tail = None;
         self.node_map.clear();
+        self.slab.clear();
     }
 
     #[inline(always)]
@@ -1144,6 +1138,7 @@ where
         // safe unwrap, validate above that tail is Some
         let tail_idx = self.tail.unwrap();
         self.unlink_node(tail_idx);
+        self.stats.eviction();
 
         unsafe {
             self.node_map
@@ -1152,11 +1147,12 @@ where
         }
     }
 
-    /// Fetch value from the cache for associated key.
-    /// Key value pair will then be promoted to most recently used.
-    /// When they Key does not exist in the cache, None will be returned.
+    /// Returns a clone of the value for the given key and promotes it to most recently used.
+    ///
+    /// Returns `None` on a cache miss.
     pub fn get(&mut self, key: &K) -> Option<V> {
         let Some(entry_idx_ref) = self.node_map.get(key) else {
+            self.stats.miss();
             return None;
         };
         let entry_idx = *entry_idx_ref;
@@ -1180,8 +1176,7 @@ where
         Some(value)
     }
 
-    /// Statistics are kept internally detailing the number of cache hits, misses, and evictions
-    /// for promoting operations.
+    /// Returns a snapshot of cache hit, miss, and eviction counts.
     pub fn statistics(&self) -> CacheStats {
         self.stats.clone()
     }
