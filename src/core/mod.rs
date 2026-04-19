@@ -11,8 +11,6 @@ use thiserror::Error;
 pub enum CacheError {
     #[error("Key does not exist in cache")]
     KeyNotExist,
-    #[error("Cache is internally corrupt, file a bug report")]
-    CorruptedCacheError,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -53,11 +51,6 @@ impl CacheStats {
     fn eviction(&mut self) {
         self.evictions += 1
     }
-}
-
-pub struct CacheItem<K, T> {
-    pub key: K,
-    pub value: T,
 }
 
 #[derive(Debug)]
@@ -1538,6 +1531,49 @@ mod shard_cache_test {
         assert_eq!(c.get(&1), Some(10));
         assert_eq!(c.get(&3), Some(30));
         assert_eq!(c.get(&4), Some(40));
+    }
+
+    #[test]
+    fn statistics_get_hit_and_miss() {
+        let mut c = CacheShard::with_capacity(NonZeroUsize::new(3).unwrap());
+        c.insert(1, 10);
+        c.insert(2, 20);
+
+        c.get(&1); // hit
+        c.get(&1); // hit
+        c.get(&99); // miss
+
+        let stats = c.statistics();
+        assert_eq!(stats.hits, 2);
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.evictions, 0);
+    }
+
+    #[test]
+    fn statistics_lru_eviction_on_insert() {
+        let mut c = CacheShard::with_capacity(NonZeroUsize::new(2).unwrap());
+        c.insert(1, 10);
+        c.insert(2, 20);
+        c.insert(3, 30); // evicts 1
+        c.insert(4, 40); // evicts 2
+
+        let stats = c.statistics();
+        assert_eq!(stats.evictions, 2);
+    }
+
+    #[test]
+    fn statistics_explicit_evict_does_not_count_as_lru_eviction() {
+        let mut c = CacheShard::with_capacity(NonZeroUsize::new(3).unwrap());
+        c.insert(1, 10);
+        c.insert(2, 20);
+
+        c.evict(&1);
+        c.evict(&99); // key not present — no eviction
+
+        let stats = c.statistics();
+        assert_eq!(stats.evictions, 0);
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 0);
     }
 }
 

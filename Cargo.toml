@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "Contains multiple LRU cache implementations, including a sharded LRU cache implementation for concurrent performance, DashCache."
-categories = ["caching", "concurrecny"]
+categories = ["caching", "concurrency"]
 keywords = ["lru", "cache", "sharding", "concurrency"]
 repository = "https://github.com/khammersmith17/dash-cache"
 
