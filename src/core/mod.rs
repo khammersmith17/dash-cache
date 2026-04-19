@@ -118,10 +118,7 @@ where
     pub fn head(&self) -> Option<K> {
         match self.head {
             Some(ref weak_head) => {
-                let Some(head) = weak_head.upgrade() else {
-                    return None;
-                };
-
+                let head = weak_head.upgrade()?;
                 Some(head.borrow().key.clone())
             }
             None => None,
@@ -131,9 +128,7 @@ where
     /// Removes the entry for the given key from the cache and returns its value, or `None` if the
     /// key is not present. Does not count as a miss in statistics.
     pub fn evict(&mut self, key: &K) -> Option<T> {
-        let Some(cache_entry) = self.node_map.remove(key) else {
-            return None;
-        };
+        let cache_entry = self.node_map.remove(key)?;
 
         self.unlink_node(&cache_entry);
 
@@ -178,7 +173,7 @@ where
             self.assert_invariants();
         }
         let node_rc = {
-            let Some(rc) = self.node_map.get(&key) else {
+            let Some(rc) = self.node_map.get(key) else {
                 self.stats.miss();
                 return Err(CacheError::KeyNotExist);
             };
@@ -419,9 +414,10 @@ where
         {
             self.assert_invariants();
         }
-        if self.head.is_none() {
-            return None;
-        }
+
+        // Smoke check to for is cache is empty.
+        // Cache is empty if head is None.
+        let _ = self.head.as_ref()?;
         let node_rc = if let Some(src_node_rc) = self.node_map.get(key) {
             src_node_rc.clone()
         } else {
@@ -464,9 +460,9 @@ struct ShardCacheEntry<K, T> {
 /// Safety invariants are documented inline and heavily asserted in debug builds. Release builds
 /// skip these checks and perform consistently with comparable crates such as `lru`.
 ///
-/// This type is `Send + Sync` and was the original internal shard type for `DashCache`. It has
-/// since been superseded by `SlabShard` for better cache locality, but is retained as a
-/// standalone cache type.
+/// This type is `!Send + !Sync` due to its raw pointer fields and is intended for single-threaded
+/// use only. It was the original internal shard type for `DashCache` but has since been superseded
+/// by `SlabShard` for better cache locality. It is retained as a standalone cache type.
 pub struct CacheShard<K, T, S = ahash::RandomState>
 where
     K: Hash + Eq + Clone,
@@ -550,11 +546,9 @@ where
         );
         let entry_ptr = {
             let Some(cache_entry) = self.node_map.get(key) else {
-                self.stats.miss();
                 return Err(CacheError::KeyNotExist);
             };
-            let ptr = NonNull::from(cache_entry.as_ref());
-            ptr
+            NonNull::from(cache_entry.as_ref())
         };
         self.stats.hit();
         self.update_cache_entry(entry_ptr, value);
@@ -565,12 +559,8 @@ where
     /// Removes the entry for the given key and returns its value, or `None` if the key is not
     /// present. Does not count as a miss in statistics.
     pub fn evict(&mut self, key: &K) -> Option<T> {
-        let Some(mut cache_entry) = self.node_map.remove(key) else {
-            return None;
-        };
-
+        let mut cache_entry = self.node_map.remove(key)?;
         let cache_entry_ptr = NonNull::from(cache_entry.as_mut());
-
         self.unlink_node(cache_entry_ptr);
 
         #[cfg(debug_assertions)]
@@ -625,7 +615,6 @@ where
             match self.node_map.entry(key.clone()) {
                 Entry::Occupied(occ_entry) => {
                     let ptr = NonNull::from(occ_entry.get().as_ref());
-                    drop(occ_entry);
                     self.update_cache_entry(ptr, value);
                     return;
                 }
@@ -666,7 +655,7 @@ where
 
         let (prev_opt, next_opt) = unsafe {
             let curr = node.as_ref();
-            (curr.prev.clone(), curr.next.clone())
+            (curr.prev, curr.next)
         };
 
         match (prev_opt, next_opt) {
@@ -762,6 +751,7 @@ where
         // safe unwrap, validate above that tail is Some
         let tail_ptr = self.tail.unwrap();
         self.unlink_node(tail_ptr);
+        self.stats.eviction();
 
         unsafe { self.node_map.remove(&tail_ptr.as_ref().key).unwrap() }
     }
@@ -775,8 +765,7 @@ where
                 self.stats.miss();
                 return None;
             };
-            let ptr = NonNull::from(entry_box.as_ref());
-            ptr
+            NonNull::from(entry_box.as_ref())
         };
 
         #[cfg(debug_assertions)]
@@ -855,7 +844,7 @@ where
     /// Creates a new `SlabShard` with the given capacity. Panics if capacity exceeds `u32::MAX`.
     pub fn with_capacity_and_hasher(capacity: NonZeroUsize, hasher: S) -> SlabShard<K, V, S> {
         let cap = capacity.get();
-        if cap as u32 > u32::MAX {
+        if cap > u32::MAX as usize {
             panic!("capacity must be <= {}", u32::MAX);
         }
 
@@ -923,10 +912,7 @@ where
     /// Uses `swap_remove` internally: the last slab entry is moved into the evicted slot, and all
     /// index references to it (in `node_map` and the recency list) are updated accordingly.
     pub fn evict(&mut self, key: &K) -> Option<V> {
-        let Some(entry_idx) = self.node_map.remove(key) else {
-            return None;
-        };
-
+        let entry_idx = self.node_map.remove(key)?;
         self.unlink_node(entry_idx);
 
         #[cfg(debug_assertions)]
@@ -942,7 +928,7 @@ where
                 let entry = &self.slab.get_unchecked(len - 1);
                 (&entry.key, entry.prev, entry.next)
             };
-            *self.node_map.get_mut(&swap_key).unwrap() = entry_idx;
+            *self.node_map.get_mut(swap_key).unwrap() = entry_idx;
             if let Some(swap_prev) = swap_prev {
                 unsafe { self.slab.get_unchecked_mut(swap_prev as usize).next = Some(entry_idx) };
             }
@@ -1044,7 +1030,7 @@ where
         let (prev_opt, next_opt) = {
             let entry: &mut CacheSlabEntry<K, V> =
                 unsafe { self.slab.get_unchecked_mut(entry_idx as usize) };
-            let (prev_opt, next_opt) = (entry.prev.clone(), entry.next.clone());
+            let (prev_opt, next_opt) = (entry.prev, entry.next);
             entry.prev = None;
             entry.next = None;
             (prev_opt, next_opt)

@@ -54,8 +54,7 @@ where
 
     async fn get(&self, key: &K) -> Option<V> {
         let mut guard = self.handle.write().await;
-        let value = guard.get(key);
-        value
+        guard.get(key)
     }
 
     async fn evict(&self, key: &K) -> Option<V> {
@@ -291,6 +290,11 @@ where
     /// Returns the total number of entries across all shards.
     pub async fn len(&self) -> usize {
         self.inner.len().await
+    }
+
+    /// Returns whether the entire cache is empty.
+    pub async fn is_empty(&self) -> bool {
+        self.len().await == 0_usize
     }
 
     /// Updates the value for an existing key and promotes it to most recently used within its shard.
