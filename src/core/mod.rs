@@ -174,7 +174,6 @@ where
         }
         let node_rc = {
             let Some(rc) = self.node_map.get(key) else {
-                self.stats.miss();
                 return Err(CacheError::KeyNotExist);
             };
             rc.clone()
@@ -417,7 +416,10 @@ where
 
         // Smoke check to for is cache is empty.
         // Cache is empty if head is None.
-        let _ = self.head.as_ref()?;
+        if self.head.is_none() {
+            self.stats.miss();
+            return None;
+        }
         let node_rc = if let Some(src_node_rc) = self.node_map.get(key) {
             src_node_rc.clone()
         } else {
