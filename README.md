@@ -17,7 +17,7 @@ There are three single-threaded implementations:
 
 ## Benchmarks
 
-All times are mean latency for the full batch of operations. Benchmarks run in release mode via [Criterion](https://github.com/bheisler/criterion.rs). If you would like to see the raw benchmark reports, please reach out.
+All times are mean latency for the full batch of operations. Benchmarks run in release mode via [Criterion](https://github.com/bheisler/criterion.rs). If you would like to see the raw benchmark reports, please reach out. The benchmarks themselves can be found in /benches.
 
 ### Insert + Get (no eviction, 1 000 ops)
 
