@@ -401,7 +401,11 @@ where
     /// Returns a clone of the value for the given key and promotes it to most recently used.
     ///
     /// Returns `None` on a cache miss.
-    pub fn get(&mut self, key: &K) -> Option<T> {
+    pub fn get<Q>(&mut self, key: &Q) -> Option<T>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         #[cfg(debug_assertions)]
         {
             self.assert_invariants();
@@ -754,7 +758,11 @@ where
     /// Returns a clone of the value for the given key and promotes it to most recently used.
     ///
     /// Returns `None` on a cache miss.
-    pub fn get(&mut self, key: &K) -> Option<T> {
+    pub fn get<Q>(&mut self, key: &Q) -> Option<T>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         let entry_ptr = {
             let Some(entry_box) = self.node_map.get(key) else {
                 self.stats.miss();
@@ -1131,7 +1139,11 @@ where
     /// Returns a clone of the value for the given key and promotes it to most recently used.
     ///
     /// Returns `None` on a cache miss.
-    pub fn get(&mut self, key: &K) -> Option<V> {
+    pub fn get<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         let Some(entry_idx_ref) = self.node_map.get(key) else {
             self.stats.miss();
             return None;
@@ -1304,6 +1316,21 @@ mod single_threaded_test {
         assert_eq!(c.evict(&"a"), None);
         assert_eq!(c.evict(&"b"), Some(2));
         assert!(c.is_empty());
+    }
+
+    #[test]
+    fn get_accepts_borrowed_key() {
+        let mut c: LruCache<String, u32> = LruCache::with_capacity(NonZeroUsize::new(3).unwrap());
+        c.insert("hello".to_string(), 1);
+        c.insert("world".to_string(), 2);
+        // &str is accepted where K = String via Borrow<str>
+        assert_eq!(c.get("hello"), Some(1));
+        assert_eq!(c.get("world"), Some(2));
+        assert_eq!(c.get("missing"), None);
+        // hit/miss stats should reflect the lookups
+        let stats = c.statistics();
+        assert_eq!(stats.hits, 2);
+        assert_eq!(stats.misses, 1);
     }
 }
 
@@ -1575,6 +1602,21 @@ mod shard_cache_test {
         assert_eq!(stats.hits, 0);
         assert_eq!(stats.misses, 0);
     }
+
+    #[test]
+    fn get_accepts_borrowed_key() {
+        let mut c: CacheShard<String, u32> =
+            CacheShard::with_capacity(NonZeroUsize::new(3).unwrap());
+        c.insert("hello".to_string(), 1);
+        c.insert("world".to_string(), 2);
+        // &str is accepted where K = String via Borrow<str>
+        assert_eq!(c.get("hello"), Some(1));
+        assert_eq!(c.get("world"), Some(2));
+        assert_eq!(c.get("missing"), None);
+        let stats = c.statistics();
+        assert_eq!(stats.hits, 2);
+        assert_eq!(stats.misses, 1);
+    }
 }
 
 #[cfg(test)]
@@ -1786,5 +1828,20 @@ mod indexed_shard_cache_test {
         assert_eq!(c.get(&1), Some(10));
         assert_eq!(c.get(&3), Some(30));
         assert_eq!(c.get(&4), Some(40));
+    }
+
+    #[test]
+    fn get_accepts_borrowed_key() {
+        let mut c: SlabShard<String, u32> =
+            SlabShard::with_capacity(NonZeroUsize::new(3).unwrap());
+        c.insert("hello".to_string(), 1);
+        c.insert("world".to_string(), 2);
+        // &str is accepted where K = String via Borrow<str>
+        assert_eq!(c.get("hello"), Some(1));
+        assert_eq!(c.get("world"), Some(2));
+        assert_eq!(c.get("missing"), None);
+        let stats = c.statistics();
+        assert_eq!(stats.hits, 2);
+        assert_eq!(stats.misses, 1);
     }
 }

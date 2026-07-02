@@ -52,7 +52,11 @@ where
         guard.statistics()
     }
 
-    async fn get(&self, key: &K) -> Option<V> {
+    async fn get<Q>(&self, key: &Q) -> Option<V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         let mut guard = self.handle.write().await;
         guard.get(key)
     }
@@ -255,7 +259,11 @@ where
 
     /// Returns a clone of the value for the given key and promotes it to most recently used within
     /// its shard. Acquires a write lock on the key's shard. Returns `None` on a cache miss.
-    pub async fn get(&self, key: &K) -> Option<V> {
+    pub async fn get<Q>(&self, key: &Q) -> Option<V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         self.inner.get(key).await
     }
 
@@ -392,7 +400,11 @@ where
         len
     }
 
-    async fn get(&self, key: &K) -> Option<T> {
+    async fn get<Q>(&self, key: &Q) -> Option<T>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         let shard_key = self.compute_shard(key);
         let shard_cache = &self.cache_shards[shard_key];
         shard_cache.get(key).await
@@ -410,7 +422,10 @@ where
         shard_cache.insert(key, value).await;
     }
 
-    fn compute_shard(&self, key: &K) -> usize {
+    fn compute_shard<Q>(&self, key: &Q) -> usize
+    where
+        Q: Hash + ?Sized,
+    {
         let mut hasher = AHasher::default();
         key.hash(&mut hasher);
         let hash_value = hasher.finish();
@@ -699,6 +714,23 @@ mod dash_cache_tests {
         for i in 0..n {
             assert_eq!(cache.get(&i).await, Some(i * 10), "missing key {i}");
         }
+    }
+
+    #[tokio::test]
+    async fn get_accepts_borrowed_key() {
+        let cache: DashCache<String, u32> = DashCache::with_num_shards_and_capacity(
+            NonZeroUsize::new(4).unwrap(),
+            NonZeroUsize::new(10).unwrap(),
+        );
+        cache.insert("hello".to_string(), 1).await;
+        cache.insert("world".to_string(), 2).await;
+        // &str is accepted where K = String via Borrow<str>
+        assert_eq!(cache.get("hello").await, Some(1));
+        assert_eq!(cache.get("world").await, Some(2));
+        assert_eq!(cache.get("missing").await, None);
+        let stats = cache.statistics().await;
+        assert_eq!(stats.hits, 2);
+        assert_eq!(stats.misses, 1);
     }
 
     #[tokio::test]
