@@ -1832,8 +1832,7 @@ mod indexed_shard_cache_test {
 
     #[test]
     fn get_accepts_borrowed_key() {
-        let mut c: SlabShard<String, u32> =
-            SlabShard::with_capacity(NonZeroUsize::new(3).unwrap());
+        let mut c: SlabShard<String, u32> = SlabShard::with_capacity(NonZeroUsize::new(3).unwrap());
         c.insert("hello".to_string(), 1);
         c.insert("world".to_string(), 2);
         // &str is accepted where K = String via Borrow<str>
