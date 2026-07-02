@@ -1,6 +1,7 @@
 use crate::core::{CacheError, CacheStats, SlabShard};
 use ahash::AHasher;
 use futures::stream::{self, StreamExt};
+use std::fmt;
 use std::hash::Hasher;
 use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
@@ -11,8 +12,8 @@ use tokio::sync::RwLock;
 // wrap CacheShard in RwLock for better type semantics
 struct LockedCache<K, V, S = ahash::RandomState>
 where
-    K: Hash + Ord + Clone,
-    V: Clone,
+    K: Hash + Ord + Clone + fmt::Debug,
+    V: Clone + fmt::Debug,
     S: BuildHasher,
 {
     handle: RwLock<SlabShard<K, V, S>>,
@@ -22,8 +23,8 @@ where
 // This level on the type abstraction contains all concurrency primitives present in the type
 impl<K, V, S> LockedCache<K, V, S>
 where
-    K: Hash + Ord + Clone,
-    V: Clone,
+    K: Hash + Ord + Clone + fmt::Debug,
+    V: Clone + fmt::Debug,
     S: BuildHasher,
 {
     fn with_capacity_and_hasher(cap: NonZeroUsize, hasher: S) -> LockedCache<K, V, S> {
@@ -119,8 +120,8 @@ where
 
 impl<K, V, S> DashCacheBuilder<K, V, S>
 where
-    K: Hash + Ord + Clone + Send + Sync + 'static,
-    V: Clone + Send + Sync + 'static,
+    K: Hash + Ord + Clone + fmt::Debug + Send + Sync + 'static,
+    V: Clone + fmt::Debug + Send + Sync + 'static,
     S: BuildHasher + Clone,
 {
     /// Sets the number of shards. Per-shard capacity is computed as `ceil(total_cap / num_shards)`
@@ -189,8 +190,8 @@ where
 #[derive(Clone)]
 pub struct DashCache<K, V, S = ahash::RandomState>
 where
-    K: Hash + Ord + Clone + Send + Sync + 'static,
-    V: Clone + Send + Sync + 'static,
+    K: Hash + Ord + fmt::Debug + Clone + Send + Sync + 'static,
+    V: Clone + fmt::Debug + Send + Sync + 'static,
     S: BuildHasher,
 {
     inner: Arc<InnerCacheShards<K, V, S>>,
@@ -198,8 +199,8 @@ where
 
 impl<K, V> DashCache<K, V, ahash::RandomState>
 where
-    K: Hash + Ord + Clone + Send + Sync + 'static,
-    V: Clone + Send + Sync + 'static,
+    K: Hash + Ord + fmt::Debug + Clone + Send + Sync + 'static,
+    V: Clone + fmt::Debug + Send + Sync + 'static,
 {
     pub fn new(capacity: NonZeroUsize) -> DashCache<K, V, ahash::RandomState> {
         DashCache::new_with_hasher(capacity, ahash::RandomState::new())
@@ -222,8 +223,8 @@ where
 
 impl<K, V, S> DashCache<K, V, S>
 where
-    K: Hash + Ord + Clone + Send + Sync + 'static,
-    V: Clone + Send + Sync + 'static,
+    K: Hash + Ord + Clone + fmt::Debug + Send + Sync + 'static,
+    V: Clone + fmt::Debug + Send + Sync + 'static,
     S: BuildHasher + Clone,
 {
     /// Creates a `DashCache` with one shard per logical CPU core.
@@ -320,8 +321,8 @@ where
 // Owns the shard array and routes all operations to the correct shard via key hash.
 struct InnerCacheShards<K, V, S = ahash::RandomState>
 where
-    K: Hash + Ord + Clone + Send + Sync + 'static,
-    V: Clone + Send + Sync + 'static,
+    K: Hash + Ord + Clone + fmt::Debug + Send + Sync + 'static,
+    V: Clone + fmt::Debug + Send + Sync + 'static,
     S: BuildHasher,
 {
     cache_shards: Box<[LockedCache<K, V, S>]>,
@@ -330,8 +331,8 @@ where
 
 impl<K, T, S> InnerCacheShards<K, T, S>
 where
-    K: Hash + Ord + Clone + Send + Sync + 'static,
-    T: Clone + Send + Sync + 'static,
+    K: Hash + Ord + Clone + fmt::Debug + Send + Sync + 'static,
+    T: Clone + fmt::Debug + Send + Sync + 'static,
     S: BuildHasher + Clone,
 {
     fn new_with_hasher(capacity: NonZeroUsize, hasher: S) -> InnerCacheShards<K, T, S> {

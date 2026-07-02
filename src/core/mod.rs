@@ -2,10 +2,15 @@ use core::ptr::NonNull;
 use std::cell::{RefCell, RefMut};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::num::NonZeroUsize;
 use std::rc::{Rc, Weak};
 use thiserror::Error;
+
+mod entry;
+mod ttl;
+use entry::{CacheEntry, CacheSlabEntry, ShardCacheEntry};
 
 #[derive(Debug, Error)]
 pub enum CacheError {
@@ -53,14 +58,6 @@ impl CacheStats {
     }
 }
 
-#[derive(Debug)]
-struct CacheEntry<K, T> {
-    value: T,
-    key: K,
-    prev: Option<Weak<RefCell<CacheEntry<K, T>>>>,
-    next: Option<Weak<RefCell<CacheEntry<K, T>>>>,
-}
-
 /// A single-threaded LRU cache. Not `Send` or `Sync` — use `DashCache` for concurrent access.
 ///
 /// Internally uses `Rc<RefCell<T>>` for linked list nodes, making this a fully safe implementation.
@@ -71,7 +68,7 @@ struct CacheEntry<K, T> {
 /// Debug builds run invariant assertions on every operation. Release performance is good but
 /// slower than `CacheShard` or `SlabShard` due to reference counting overhead.
 #[derive(Debug)]
-pub struct LruCache<K, T> {
+pub struct LruCache<K: Hash + Eq + fmt::Debug, T: Clone + fmt::Debug> {
     cap: usize,
     node_map: HashMap<K, Rc<RefCell<CacheEntry<K, T>>>>,
     head: Option<Weak<RefCell<CacheEntry<K, T>>>>,
@@ -439,16 +436,6 @@ where
     }
 }
 
-// Internal linked list node for CacheShard. Uses NonNull raw pointers for prev/next to avoid
-// the reference-counting overhead of Rc, at the cost of requiring manual safety invariants.
-#[derive(Clone)]
-struct ShardCacheEntry<K, T> {
-    key: K,
-    value: T,
-    next: Option<NonNull<ShardCacheEntry<K, T>>>,
-    prev: Option<NonNull<ShardCacheEntry<K, T>>>,
-}
-
 /// An unsafe, single-threaded LRU cache using `NonNull` raw pointers and `Box`-heap-allocated
 /// nodes for the recency list.
 ///
@@ -460,8 +447,8 @@ struct ShardCacheEntry<K, T> {
 /// by `SlabShard` for better cache locality. It is retained as a standalone cache type.
 pub struct CacheShard<K, T, S = ahash::RandomState>
 where
-    K: Hash + Eq + Clone,
-    T: Clone,
+    K: Hash + Eq + Clone + fmt::Debug,
+    T: Clone + fmt::Debug,
     S: BuildHasher,
 {
     cap: usize,
@@ -473,8 +460,8 @@ where
 
 impl<K, T> CacheShard<K, T, ahash::RandomState>
 where
-    K: Hash + Ord + Clone,
-    T: Clone,
+    K: Hash + Ord + Clone + fmt::Debug,
+    T: Clone + fmt::Debug,
 {
     pub fn with_capacity(capacity: NonZeroUsize) -> CacheShard<K, T, ahash::RandomState> {
         CacheShard::with_capacity_and_hasher(capacity, ahash::RandomState::new())
@@ -483,8 +470,8 @@ where
 
 impl<K, T, S> CacheShard<K, T, S>
 where
-    K: Hash + Eq + Clone,
-    T: Clone,
+    K: Hash + Eq + Clone + fmt::Debug,
+    T: Clone + fmt::Debug,
     S: BuildHasher,
 {
     /// Creates a new `CacheShard` with the given capacity.
@@ -789,13 +776,6 @@ where
     }
 }
 
-struct CacheSlabEntry<K: Hash + Eq, V: Clone> {
-    key: K,
-    value: V,
-    prev: Option<u32>,
-    next: Option<u32>,
-}
-
 /// An unsafe, single-threaded LRU cache backed by a contiguous slab allocation.
 ///
 /// Unlike `CacheShard`, all entries live in a pre-allocated `Vec` and the recency list uses `u32`
@@ -808,8 +788,8 @@ struct CacheSlabEntry<K: Hash + Eq, V: Clone> {
 /// limited to `u32::MAX` entries. All values returned are clones.
 pub struct SlabShard<K, V, S = ahash::RandomState>
 where
-    K: Hash + Ord + Clone,
-    V: Clone,
+    K: Hash + Ord + Clone + fmt::Debug,
+    V: Clone + fmt::Debug,
     S: BuildHasher,
 {
     cap: usize,
@@ -822,8 +802,8 @@ where
 
 impl<K, V> SlabShard<K, V, ahash::RandomState>
 where
-    K: Hash + Ord + Clone,
-    V: Clone,
+    K: Hash + Ord + Clone + fmt::Debug,
+    V: Clone + fmt::Debug,
 {
     pub fn with_capacity(capacity: NonZeroUsize) -> SlabShard<K, V, ahash::RandomState> {
         SlabShard::with_capacity_and_hasher(capacity, ahash::RandomState::new())
@@ -832,8 +812,8 @@ where
 
 impl<K, V, S> SlabShard<K, V, S>
 where
-    K: Hash + Ord + Clone,
-    V: Clone,
+    K: Hash + Ord + Clone + fmt::Debug,
+    V: Clone + fmt::Debug,
     S: BuildHasher,
 {
     /// Creates a new `SlabShard` with the given capacity. Panics if capacity exceeds `u32::MAX`.
