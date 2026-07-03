@@ -120,7 +120,11 @@ where
 
     /// Removes the entry for the given key from the cache and returns its value, or `None` if the
     /// key is not present. Does not count as a miss in statistics.
-    pub fn evict(&mut self, key: &K) -> Option<T> {
+    pub fn evict<Q>(&mut self, key: &Q) -> Option<T>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         let cache_entry = self.node_map.remove(key)?;
 
         self.unlink_node(&cache_entry);
@@ -151,7 +155,11 @@ where
     }
 
     /// Returns `true` if the key exists in the cache without promoting it or recording a hit.
-    pub fn contains(&self, key: &K) -> bool {
+    pub fn contains<Q>(&self, key: &Q) -> bool
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         self.node_map.contains_key(key)
     }
 
@@ -160,7 +168,11 @@ where
     /// Returns `Err(CacheError::KeyNotExist)` if the key is not in the cache. Use `insert` to
     /// write a new key. There is no `get_mut` — this is the correct method for mutating a stored
     /// value.
-    pub fn update(&mut self, key: &K, value: T) -> Result<(), CacheError> {
+    pub fn update<Q>(&mut self, key: &Q, value: T) -> Result<(), CacheError>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         #[cfg(debug_assertions)]
         {
             self.assert_invariants();
@@ -507,7 +519,11 @@ where
     }
 
     /// Returns `true` if the key exists in the cache without promoting it or recording a hit.
-    pub fn contains(&self, key: &K) -> bool {
+    pub fn contains<Q>(&self, key: &Q) -> bool
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         self.node_map.contains_key(key)
     }
 
@@ -538,7 +554,11 @@ where
     /// Returns `Err(CacheError::KeyNotExist)` if the key is not in the cache. Use `insert` to
     /// write a new key. There is no `get_mut` — this is the correct method for mutating a stored
     /// value.
-    pub fn update(&mut self, key: &K, value: T) -> Result<(), CacheError> {
+    pub fn update<Q>(&mut self, key: &Q, value: T) -> Result<(), CacheError>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         debug_assert!(
             (self.head.is_some() && self.tail.is_some())
                 || (self.head.is_none() && self.tail.is_none())
@@ -557,7 +577,11 @@ where
 
     /// Removes the entry for the given key and returns its value, or `None` if the key is not
     /// present. Does not count as a miss in statistics.
-    pub fn evict(&mut self, key: &K) -> Option<T> {
+    pub fn evict<Q>(&mut self, key: &Q) -> Option<T>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         let mut cache_entry = self.node_map.remove(key)?;
         let cache_entry_ptr = NonNull::from(cache_entry.as_mut());
         self.unlink_node(cache_entry_ptr);
@@ -864,7 +888,11 @@ where
     }
 
     /// Returns `true` if the key exists in the cache without promoting it or recording a hit.
-    pub fn contains(&self, key: &K) -> bool {
+    pub fn contains<Q>(&self, key: &Q) -> bool
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         self.node_map.contains_key(key)
     }
 
@@ -895,7 +923,11 @@ where
     /// Returns `Err(CacheError::KeyNotExist)` if the key is not in the cache. Use `insert` to
     /// write a new key. There is no `get_mut` — this is the correct method for mutating a stored
     /// value.
-    pub fn update(&mut self, key: &K, value: V) -> Result<(), CacheError> {
+    pub fn update<Q>(&mut self, key: &Q, value: V) -> Result<(), CacheError>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         debug_assert!(
             (self.head.is_some() && self.tail.is_some())
                 || (self.head.is_none() && self.tail.is_none())
@@ -914,7 +946,11 @@ where
     ///
     /// Uses `swap_remove` internally: the last slab entry is moved into the evicted slot, and all
     /// index references to it (in `node_map` and the recency list) are updated accordingly.
-    pub fn evict(&mut self, key: &K) -> Option<V> {
+    pub fn evict<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         let entry_idx = self.node_map.remove(key)?;
         self.unlink_node(entry_idx);
 
@@ -931,7 +967,7 @@ where
                 let entry = &self.slab.get_unchecked(len - 1);
                 (&entry.key, entry.prev, entry.next)
             };
-            *self.node_map.get_mut(swap_key).unwrap() = entry_idx;
+            *self.node_map.get_mut::<K>(swap_key).unwrap() = entry_idx;
             if let Some(swap_prev) = swap_prev {
                 unsafe { self.slab.get_unchecked_mut(swap_prev as usize).next = Some(entry_idx) };
             }
@@ -1332,6 +1368,33 @@ mod single_threaded_test {
         assert_eq!(stats.hits, 2);
         assert_eq!(stats.misses, 1);
     }
+
+    #[test]
+    fn contains_accepts_borrowed_key() {
+        let mut c: LruCache<String, u32> = LruCache::with_capacity(NonZeroUsize::new(3).unwrap());
+        c.insert("hello".to_string(), 1);
+        assert!(c.contains("hello"));
+        assert!(!c.contains("missing"));
+    }
+
+    #[test]
+    fn evict_accepts_borrowed_key() {
+        let mut c: LruCache<String, u32> = LruCache::with_capacity(NonZeroUsize::new(3).unwrap());
+        c.insert("hello".to_string(), 1);
+        c.insert("world".to_string(), 2);
+        assert_eq!(c.evict("hello"), Some(1));
+        assert_eq!(c.evict("hello"), None);
+        assert!(c.contains("world"));
+    }
+
+    #[test]
+    fn update_accepts_borrowed_key() {
+        let mut c: LruCache<String, u32> = LruCache::with_capacity(NonZeroUsize::new(3).unwrap());
+        c.insert("hello".to_string(), 1);
+        c.update("hello", 99).unwrap();
+        assert_eq!(c.get("hello"), Some(99));
+        assert!(c.update("missing", 0).is_err());
+    }
 }
 
 #[cfg(test)]
@@ -1617,6 +1680,36 @@ mod shard_cache_test {
         assert_eq!(stats.hits, 2);
         assert_eq!(stats.misses, 1);
     }
+
+    #[test]
+    fn contains_accepts_borrowed_key() {
+        let mut c: CacheShard<String, u32> =
+            CacheShard::with_capacity(NonZeroUsize::new(3).unwrap());
+        c.insert("hello".to_string(), 1);
+        assert!(c.contains("hello"));
+        assert!(!c.contains("missing"));
+    }
+
+    #[test]
+    fn evict_accepts_borrowed_key() {
+        let mut c: CacheShard<String, u32> =
+            CacheShard::with_capacity(NonZeroUsize::new(3).unwrap());
+        c.insert("hello".to_string(), 1);
+        c.insert("world".to_string(), 2);
+        assert_eq!(c.evict("hello"), Some(1));
+        assert_eq!(c.evict("hello"), None);
+        assert!(c.contains("world"));
+    }
+
+    #[test]
+    fn update_accepts_borrowed_key() {
+        let mut c: CacheShard<String, u32> =
+            CacheShard::with_capacity(NonZeroUsize::new(3).unwrap());
+        c.insert("hello".to_string(), 1);
+        c.update("hello", 99).unwrap();
+        assert_eq!(c.get("hello"), Some(99));
+        assert!(c.update("missing", 0).is_err());
+    }
 }
 
 #[cfg(test)]
@@ -1842,5 +1935,35 @@ mod indexed_shard_cache_test {
         let stats = c.statistics();
         assert_eq!(stats.hits, 2);
         assert_eq!(stats.misses, 1);
+    }
+
+    #[test]
+    fn contains_accepts_borrowed_key() {
+        let mut c: SlabShard<String, u32> =
+            SlabShard::with_capacity(NonZeroUsize::new(3).unwrap());
+        c.insert("hello".to_string(), 1);
+        assert!(c.contains("hello"));
+        assert!(!c.contains("missing"));
+    }
+
+    #[test]
+    fn evict_accepts_borrowed_key() {
+        let mut c: SlabShard<String, u32> =
+            SlabShard::with_capacity(NonZeroUsize::new(3).unwrap());
+        c.insert("hello".to_string(), 1);
+        c.insert("world".to_string(), 2);
+        assert_eq!(c.evict("hello"), Some(1));
+        assert_eq!(c.evict("hello"), None);
+        assert!(c.contains("world"));
+    }
+
+    #[test]
+    fn update_accepts_borrowed_key() {
+        let mut c: SlabShard<String, u32> =
+            SlabShard::with_capacity(NonZeroUsize::new(3).unwrap());
+        c.insert("hello".to_string(), 1);
+        c.update("hello", 99).unwrap();
+        assert_eq!(c.get("hello"), Some(99));
+        assert!(c.update("missing", 0).is_err());
     }
 }
