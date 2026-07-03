@@ -61,18 +61,30 @@ where
         guard.get(key)
     }
 
-    async fn evict(&self, key: &K) -> Option<V> {
+    async fn evict<Q>(&self, key: &Q) -> Option<V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         let mut guard = self.handle.write().await;
         guard.evict(key)
     }
 
-    async fn update(&self, key: &K, value: V) -> Result<(), CacheError> {
+    async fn update<Q>(&self, key: &Q, value: V) -> Result<(), CacheError>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         let mut guard = self.handle.write().await;
         guard.update(key, value)?;
         Ok(())
     }
 
-    async fn contains(&self, key: &K) -> bool {
+    async fn contains<Q>(&self, key: &Q) -> bool
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         let guard = self.handle.read().await;
         guard.contains(key)
     }
@@ -279,7 +291,11 @@ where
     /// Returns `true` if the key exists in the cache without promoting it or recording a hit.
     ///
     /// This is the only read-only method — it acquires a read lock and does not modify the shard.
-    pub async fn contains(&self, key: &K) -> bool {
+    pub async fn contains<Q>(&self, key: &Q) -> bool
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         self.inner.contains(key).await
     }
 
@@ -291,7 +307,11 @@ where
 
     /// Removes the entry for the given key and returns its value, or `None` if the key is not
     /// present. Acquires a write lock on the key's shard.
-    pub async fn evict(&self, key: &K) -> Option<V> {
+    pub async fn evict<Q>(&self, key: &Q) -> Option<V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         self.inner.evict(key).await
     }
 
@@ -309,7 +329,11 @@ where
     ///
     /// Returns `Err(CacheError::KeyNotExist)` if the key is not in the cache — use `insert` to
     /// write a new key. There is no `get_mut`. Acquires a write lock on the key's shard.
-    pub async fn update(&self, key: &K, value: V) -> Result<(), CacheError> {
+    pub async fn update<Q>(&self, key: &Q, value: V) -> Result<(), CacheError>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         self.inner.update(key, value).await?;
         Ok(())
     }
@@ -432,20 +456,32 @@ where
         hash_value as usize % usize::from(self.num_shards)
     }
 
-    async fn contains(&self, key: &K) -> bool {
+    async fn contains<Q>(&self, key: &Q) -> bool
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         let shard_key = self.compute_shard(key);
         let shard_cache = &self.cache_shards[shard_key];
         shard_cache.contains(key).await
     }
 
-    async fn update(&self, key: &K, value: T) -> Result<(), CacheError> {
+    async fn update<Q>(&self, key: &Q, value: T) -> Result<(), CacheError>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         let shard_key = self.compute_shard(key);
         let shard_cache = &self.cache_shards[shard_key];
         shard_cache.update(key, value).await?;
         Ok(())
     }
 
-    async fn evict(&self, key: &K) -> Option<T> {
+    async fn evict<Q>(&self, key: &Q) -> Option<T>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         let shard_key = self.compute_shard(key);
         let shard_cache = &self.cache_shards[shard_key];
         shard_cache.evict(key).await
@@ -731,6 +767,42 @@ mod dash_cache_tests {
         let stats = cache.statistics().await;
         assert_eq!(stats.hits, 2);
         assert_eq!(stats.misses, 1);
+    }
+
+    #[tokio::test]
+    async fn contains_accepts_borrowed_key() {
+        let cache: DashCache<String, u32> = DashCache::with_num_shards_and_capacity(
+            NonZeroUsize::new(4).unwrap(),
+            NonZeroUsize::new(10).unwrap(),
+        );
+        cache.insert("hello".to_string(), 1).await;
+        assert!(cache.contains("hello").await);
+        assert!(!cache.contains("missing").await);
+    }
+
+    #[tokio::test]
+    async fn evict_accepts_borrowed_key() {
+        let cache: DashCache<String, u32> = DashCache::with_num_shards_and_capacity(
+            NonZeroUsize::new(4).unwrap(),
+            NonZeroUsize::new(10).unwrap(),
+        );
+        cache.insert("hello".to_string(), 1).await;
+        cache.insert("world".to_string(), 2).await;
+        assert_eq!(cache.evict("hello").await, Some(1));
+        assert_eq!(cache.evict("hello").await, None);
+        assert!(cache.contains("world").await);
+    }
+
+    #[tokio::test]
+    async fn update_accepts_borrowed_key() {
+        let cache: DashCache<String, u32> = DashCache::with_num_shards_and_capacity(
+            NonZeroUsize::new(4).unwrap(),
+            NonZeroUsize::new(10).unwrap(),
+        );
+        cache.insert("hello".to_string(), 1).await;
+        cache.update("hello", 99).await.unwrap();
+        assert_eq!(cache.get("hello").await, Some(99));
+        assert!(cache.update("missing", 0).await.is_err());
     }
 
     #[tokio::test]
