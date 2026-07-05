@@ -457,7 +457,7 @@ where
 
 // Internal linked list node for CacheShard. Uses NonNull raw pointers for prev/next to avoid
 // the reference-counting overhead of Rc, at the cost of requiring manual safety invariants.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct ShardCacheEntry<K, T> {
     key: K,
     value: T,
@@ -474,6 +474,7 @@ struct ShardCacheEntry<K, T> {
 /// This type is `!Send + !Sync` due to its raw pointer fields and is intended for single-threaded
 /// use only. It was the original internal shard type for `DashCache` but has since been superseded
 /// by `SlabShard` for better cache locality. It is retained as a standalone cache type.
+#[derive(Debug)]
 pub struct CacheShard<K, T, S = ahash::RandomState>
 where
     K: Hash + Eq + Clone,
@@ -821,6 +822,7 @@ where
     }
 }
 
+#[derive(Debug)]
 struct CacheSlabEntry<K: Hash + Eq, V: Clone> {
     key: K,
     value: V,
@@ -838,6 +840,7 @@ struct CacheSlabEntry<K: Hash + Eq, V: Clone> {
 ///
 /// Safety invariants are documented inline and heavily asserted in debug builds. Capacity is
 /// limited to `u32::MAX` entries. All values returned are clones.
+#[derive(Debug)]
 pub struct SlabShard<K, V, S = ahash::RandomState>
 where
     K: Hash + Ord + Clone,
