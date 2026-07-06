@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 // wrap CacheShard in RwLock for better type semantics
+#[derive(Debug)]
 struct LockedCache<K, V, S = ahash::RandomState>
 where
     K: Hash + Ord + Clone,
@@ -102,6 +103,7 @@ where
 /// [`with_num_shards`]: DashCacheBuilder::with_num_shards
 /// [`with_hasher`]: DashCacheBuilder::with_hasher
 /// [`build`]: DashCacheBuilder::build
+#[derive(Debug)]
 pub struct DashCacheBuilder<K, V, S = ahash::RandomState>
 where
     K: Hash + Ord + Clone + Send + Sync + 'static,
@@ -202,7 +204,7 @@ where
 ///
 /// `DashCache` wraps its shards in an `Arc` internally, so cloning is cheap and no external `Arc`
 /// is required.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct DashCache<K, V, S = ahash::RandomState>
 where
     K: Hash + Ord + Clone + Send + Sync + 'static,
@@ -350,6 +352,7 @@ where
 }
 
 // Owns the shard array and routes all operations to the correct shard via key hash.
+#[derive(Debug)]
 struct InnerCacheShards<K, V, S = ahash::RandomState>
 where
     K: Hash + Ord + Clone + Send + Sync + 'static,
