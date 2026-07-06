@@ -1942,8 +1942,7 @@ mod indexed_shard_cache_test {
 
     #[test]
     fn contains_accepts_borrowed_key() {
-        let mut c: SlabShard<String, u32> =
-            SlabShard::with_capacity(NonZeroUsize::new(3).unwrap());
+        let mut c: SlabShard<String, u32> = SlabShard::with_capacity(NonZeroUsize::new(3).unwrap());
         c.insert("hello".to_string(), 1);
         assert!(c.contains("hello"));
         assert!(!c.contains("missing"));
@@ -1951,8 +1950,7 @@ mod indexed_shard_cache_test {
 
     #[test]
     fn evict_accepts_borrowed_key() {
-        let mut c: SlabShard<String, u32> =
-            SlabShard::with_capacity(NonZeroUsize::new(3).unwrap());
+        let mut c: SlabShard<String, u32> = SlabShard::with_capacity(NonZeroUsize::new(3).unwrap());
         c.insert("hello".to_string(), 1);
         c.insert("world".to_string(), 2);
         assert_eq!(c.evict("hello"), Some(1));
@@ -1962,8 +1960,7 @@ mod indexed_shard_cache_test {
 
     #[test]
     fn update_accepts_borrowed_key() {
-        let mut c: SlabShard<String, u32> =
-            SlabShard::with_capacity(NonZeroUsize::new(3).unwrap());
+        let mut c: SlabShard<String, u32> = SlabShard::with_capacity(NonZeroUsize::new(3).unwrap());
         c.insert("hello".to_string(), 1);
         c.update("hello", 99).unwrap();
         assert_eq!(c.get("hello"), Some(99));
