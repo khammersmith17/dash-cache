@@ -1,5 +1,6 @@
 pub mod core;
 pub mod dash_cache;
+pub mod ttl;
 
 /// This crate implements both an LruCache geared toward single threaded use and also a thread safe
 /// cache intended for use across threads. The thread safe cache is optimized for concurrent
@@ -9,3 +10,5 @@ pub mod dash_cache;
 /// data on get and set type methods.
 pub use core::{CacheShard, LruCache, SlabShard};
 pub use dash_cache::DashCache;
+pub use ttl::concurrent::{TtlDashCache, TtlDashCacheBuilder};
+pub use ttl::{TtlCacheStats, TtlSlabShard};
