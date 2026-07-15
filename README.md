@@ -1,5 +1,5 @@
 # dash-cache
-This repo is an attempt at an efficient LRU cache implementation. There are three implementations I am experimenting with, one geared toward single threaded usage, and two geared toward performant thread safe usage.
+This repo is an attempt at an efficient LRU cache implementation. There are three implementations I am experimenting with, one geared toward single threaded usage, and two geared toward performant thread safe usage. Please hand out a star if you find interesting. Also, if you see some improvements, feel free to submit a pull request.
 
 All implementations use an internal linked list for priority, and a HashMap to track existence in the cache.
 The implementations in LruCache, and CacheShard are very similar, diverging in the type of pointer used. LruCache uses "safe" pointers, ie Rc<RefCell<T>>, where are the CacheShard implementation uses NonNullPointers, which introduces unsafety. The invariants that define safety within this implementation are documented in the code, and heavily asserted in debug builds.
