@@ -21,46 +21,46 @@ There are three single-threaded implementations:
 
 ## Benchmarks
 
-All times are mean latency for the full batch of operations. Benchmarks run in release mode via [Criterion](https://github.com/bheisler/criterion.rs). If you would like to see the raw benchmark reports, please reach out. The benchmarks themselves can be found in /benches.
+All times are mean latency **per operation**. Benchmarks run in release mode via [Criterion](https://github.com/bheisler/criterion.rs). The benchmarks themselves can be found in /benches.
 
-### Insert + Get (no eviction, 1 000 ops)
+### Insert + Get — no eviction (1 000 inserts + 1 000 gets)
 
-| cap    | LruCache | lru crate | CacheShard | SlabShard |
-|--------|----------|-----------|------------|-------------------|
-| 1 000  | 97.4 µs  | 44.2 µs   | 55.1 µs    | **21.4 µs**       |
-| 10 000 | 112.1 µs | 116.9 µs  | 77.3 µs    | **67.8 µs**       |
+| cap    | lru crate   | SlabShard       |
+|--------|-------------|-----------------|
+| 1 000  | 16.8 ns/op  | **8.3 ns/op**   |
+| 10 000 | 33.8 ns/op  | **22.6 ns/op**  |
 
-### Insert + Get (with eviction, 10 000 ops)
+### Insert + Get — with eviction (10 000 inserts + 10 000 gets)
 
-| cap   | LruCache | lru crate | CacheShard | SlabShard |
-|-------|----------|-----------|------------|-------------------|
-| 100   | 738.1 µs | 436.3 µs  | 477.4 µs   | 499.1 µs          |
-| 1 000 | 680.0 µs | 318.2 µs  | 338.1 µs   | **294.6 µs**      |
+| cap   | lru crate   | SlabShard       |
+|-------|-------------|-----------------|
+| 100   | **19.0 ns/op** | 21.4 ns/op   |
+| 1 000 | 12.8 ns/op  | **12.4 ns/op**  |
 
-### Get hit only (warm cache, n ops)
+### Get hit only — warm cache (n gets)
 
-| n      | lru crate | CacheShard | SlabShard |
-|--------|-----------|------------|-------------------|
-| 1 000  | 27.7 µs   | 32.7 µs    | **9.8 µs**        |
-| 10 000 | 335.9 µs  | 332.0 µs   | **207.1 µs**      |
+| n      | lru crate   | SlabShard       |
+|--------|-------------|-----------------|
+| 1 000  | 21.7 ns/op  | **11.2 ns/op**  |
+| 10 000 | 22.3 ns/op  | **19.0 ns/op**  |
 
-### Insert existing key — non-full cache (n ops)
+### Insert existing key — non-full cache (n inserts)
 
-| n      | CacheShard  | SlabShard |
-|--------|-------------|-------------------|
-| 1 000  | **38.0 µs** | 41.8 µs           |
-| 10 000 | 344.4 µs    | **295.2 µs**      |
+| n      | lru crate   | SlabShard       |
+|--------|-------------|-----------------|
+| 1 000  | 25.9 ns/op  | **18.3 ns/op**  |
+| 10 000 | 27.1 ns/op  | **23.6 ns/op**  |
 
-### Insert only — eviction pressure (10 000 ops)
+### Insert only — eviction pressure (10 000 inserts)
 
-| cap   | lru crate | CacheShard | SlabShard |
-|-------|-----------|------------|-------------------|
-| 100   | 385.2 µs  | 377.0 µs   | **340.3 µs**      |
-| 1 000 | 286.3 µs  | 282.5 µs   | **229.8 µs**      |
+| cap   | lru crate   | SlabShard       |
+|-------|-------------|-----------------|
+| 100   | **30.1 ns/op** | 32.4 ns/op   |
+| 1 000 | 23.9 ns/op  | **21.4 ns/op**  |
 
-### Insert existing key — full cache (n ops)
+### Insert existing key — full cache (n inserts)
 
-| n      | CacheShard | SlabShard |
-|--------|------------|-------------------|
-| 1 000  | 33.1 µs    | **15.9 µs**       |
-| 10 000 | 311.5 µs   | **272.9 µs**      |
+| n      | lru crate   | SlabShard       |
+|--------|-------------|-----------------|
+| 1 000  | 21.9 ns/op  | **10.9 ns/op**  |
+| 10 000 | 23.1 ns/op  | **20.1 ns/op**  |

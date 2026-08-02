@@ -4,7 +4,7 @@ use std::collections::hash_map::Entry;
 use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -64,18 +64,39 @@ impl CacheStats {
 pub struct CacheEntry<K: Hash + Eq, V: Clone> {
     key: K,
     value: V,
-    prev: Option<u32>,
-    next: Option<u32>,
-    expires: Option<Instant>,
+    list_neighbors: u64,
+    expires: u64,
 }
 
 impl<K: Hash + Eq, V: Clone> CacheEntry<K, V> {
+    #[inline]
     fn is_live(&self) -> bool {
-        if let Some(ref expiration) = self.expires {
-            !util::is_expired(expiration)
-        } else {
-            true
-        }
+        !util::is_expired(self.expires)
+    }
+
+    #[inline]
+    fn clear_neighbors(&mut self) {
+        self.list_neighbors = util::pointer_idx::null_neighbors();
+    }
+
+    #[inline]
+    fn set_next(&mut self, next: Option<u32>) {
+        self.list_neighbors = util::pointer_idx::set_next_pointer(self.list_neighbors, next);
+    }
+
+    #[inline]
+    fn set_prev(&mut self, prev: Option<u32>) {
+        self.list_neighbors = util::pointer_idx::set_prev_pointer(self.list_neighbors, prev);
+    }
+
+    #[inline]
+    fn prev(&self) -> Option<u32> {
+        util::pointer_idx::get_prev_pointer(self.list_neighbors)
+    }
+
+    #[inline]
+    fn next(&self) -> Option<u32> {
+        util::pointer_idx::get_next_pointer(self.list_neighbors)
     }
 }
 
@@ -126,8 +147,8 @@ impl<K: Hash + Ord + Clone, V: Clone, S: BuildHasher> SlabShardBuilder<K, V, S> 
             ..
         } = self;
         let cap = capacity.get();
-        if cap > u32::MAX as usize {
-            panic!("capacity must be <= {}", u32::MAX);
+        if cap > (u32::MAX >> 1) as usize {
+            panic!("capacity must be <= {}", u32::MAX >> 1);
         }
 
         let node_map: HashMap<K, u32, S> = HashMap::with_capacity_and_hasher(cap, hasher);
@@ -153,7 +174,8 @@ impl<K: Hash + Ord + Clone, V: Clone, S: BuildHasher> SlabShardBuilder<K, V, S> 
 /// This is `Send + Sync` and is the internal shard type used by `DashCache`.
 ///
 /// Safety invariants are documented inline and heavily asserted in debug builds. Capacity is
-/// limited to `u32::MAX` entries. All values returned are clones.
+/// limited to `u32::MAX >> 1` entries, reserving `u32::MAX` as the null pointer sentinel.
+/// All values returned are clones.
 #[derive(Debug)]
 pub struct SlabShard<K, V, S = ahash::RandomState>
 where
@@ -200,8 +222,8 @@ where
     /// Creates a new `SlabShard` with the given capacity. Panics if capacity exceeds `u32::MAX`.
     pub fn with_capacity_and_hasher(capacity: NonZeroUsize, hasher: S) -> SlabShard<K, V, S> {
         let cap = capacity.get();
-        if cap > u32::MAX as usize {
-            panic!("capacity must be <= {}", u32::MAX);
+        if cap > (u32::MAX >> 1) as usize {
+            panic!("capacity must be <= {}", u32::MAX >> 1);
         }
 
         let node_map: HashMap<K, u32, S> = HashMap::with_capacity_and_hasher(cap, hasher);
@@ -223,8 +245,8 @@ where
         default_ttl: Duration,
     ) -> SlabShard<K, V, S> {
         let cap = capacity.get();
-        if cap > u32::MAX as usize {
-            panic!("capacity must be <= {}", u32::MAX);
+        if cap > (u32::MAX >> 1) as usize {
+            panic!("capacity must be <= {}", u32::MAX >> 1);
         }
 
         let node_map: HashMap<K, u32, S> = HashMap::with_capacity_and_hasher(cap, hasher);
@@ -268,7 +290,7 @@ where
     // Safety: `entry_idx` must be a valid index into `self.slab`, obtained from `node_map`.
     // The cache must be non-empty when this is called (debug-asserted).
     #[inline(always)]
-    fn update_cache_entry(&mut self, entry_idx: u32, value: V, expires: Option<Instant>) {
+    fn update_cache_entry(&mut self, entry_idx: u32, value: V, expires: u64) {
         debug_assert!(self.head.is_some());
         let head_idx = self.head.unwrap();
         if head_idx != entry_idx {
@@ -331,7 +353,7 @@ where
     }
 
     #[inline]
-    fn default_expiration(&self) -> Option<Instant> {
+    fn default_expiration(&self) -> u64 {
         util::expires_from_ttl(self.default_ttl)
     }
 
@@ -363,14 +385,16 @@ where
         if len > 1 && entry_idx as usize != len - 1 {
             let (swap_key, swap_prev, swap_next) = unsafe {
                 let entry = &self.slab.get_unchecked(len - 1);
-                (&entry.key, entry.prev, entry.next)
+                (&entry.key, entry.prev(), entry.next())
             };
             *self.node_map.get_mut::<K>(swap_key).unwrap() = entry_idx;
             if let Some(swap_prev) = swap_prev {
-                unsafe { self.slab.get_unchecked_mut(swap_prev as usize).next = Some(entry_idx) };
+                let entry = unsafe { self.slab.get_unchecked_mut(swap_prev as usize) };
+                entry.set_next(Some(entry_idx));
             }
             if let Some(swap_next) = swap_next {
-                unsafe { self.slab.get_unchecked_mut(swap_next as usize).prev = Some(entry_idx) };
+                let entry = unsafe { self.slab.get_unchecked_mut(swap_next as usize) };
+                entry.set_prev(Some(entry_idx));
             }
             if self.head == Some(len as u32 - 1) {
                 self.head = Some(entry_idx)
@@ -415,7 +439,7 @@ where
         self.insert_entry(key, value, self.default_expiration())
     }
 
-    fn insert_entry(&mut self, key: K, value: V, expires: Option<Instant>) {
+    fn insert_entry(&mut self, key: K, value: V, expires: u64) {
         let idx = if self.is_full() {
             match self.node_map.get(&key) {
                 Some(entry_idx) => {
@@ -427,9 +451,8 @@ where
                     let stale_entry = unsafe { self.slab.get_unchecked_mut(stale_idx as usize) };
                     stale_entry.key = key.clone();
                     stale_entry.value = value;
-                    stale_entry.prev = None;
-                    // next should already be None
-                    stale_entry.next = None;
+                    // next pointer should already be null;
+                    stale_entry.clear_neighbors();
                     stale_entry.expires = expires;
                     self.node_map.insert(key, stale_idx);
                     stale_idx
@@ -446,8 +469,7 @@ where
                     let new_entry = CacheEntry {
                         key,
                         value,
-                        prev: None,
-                        next: None,
+                        list_neighbors: util::pointer_idx::null_neighbors(),
                         expires,
                     };
                     let entry_idx = self.slab.len();
@@ -483,26 +505,33 @@ where
         let (prev_opt, next_opt) = {
             let entry: &mut CacheEntry<K, V> =
                 unsafe { self.slab.get_unchecked_mut(entry_idx as usize) };
-            let (prev_opt, next_opt) = (entry.prev, entry.next);
-            entry.prev = None;
-            entry.next = None;
+            let (prev_opt, next_opt) = (entry.prev(), entry.next());
+            entry.list_neighbors = util::pointer_idx::null_neighbors();
             (prev_opt, next_opt)
         };
 
         match (prev_opt, next_opt) {
             (Some(prev), Some(next)) => {
                 // node is in the middle of the list
-                unsafe { self.slab.get_unchecked_mut(prev as usize).next = next_opt }
-                unsafe { self.slab.get_unchecked_mut(next as usize).prev = prev_opt }
+                unsafe {
+                    self.slab
+                        .get_unchecked_mut(prev as usize)
+                        .set_next(next_opt)
+                }
+                unsafe {
+                    self.slab
+                        .get_unchecked_mut(next as usize)
+                        .set_prev(prev_opt)
+                }
             }
             (Some(prev), None) => {
                 // node is current the tail
-                unsafe { self.slab.get_unchecked_mut(prev as usize).next = None }
+                unsafe { self.slab.get_unchecked_mut(prev as usize).set_next(None) }
                 self.tail = prev_opt
             }
             (None, Some(next)) => {
                 // node is current head
-                unsafe { self.slab.get_unchecked_mut(next as usize).prev = None }
+                unsafe { self.slab.get_unchecked_mut(next as usize).set_prev(None) }
                 self.head = next_opt
             }
             (None, None) => {
@@ -535,7 +564,7 @@ where
             let node: &mut CacheEntry<K, V> =
                 unsafe { self.slab.get_unchecked_mut(entry_idx as usize) };
             // if we get a cache hit on the key, then head should be Some
-            let (prev, next) = (node.prev, node.next);
+            let (prev, next) = (node.prev(), node.next());
             debug_assert!(prev.is_none() && next.is_none());
         }
 
@@ -546,9 +575,13 @@ where
         // update node next to point to current head
         // if the list is empty set the node to be the head and tail
         if let Some(head_idx) = self.head {
-            node.next = self.head;
-            node.prev = None;
-            unsafe { self.slab.get_unchecked_mut(head_idx as usize).prev = Some(entry_idx) }
+            node.set_next(self.head);
+            node.set_prev(None);
+            unsafe {
+                self.slab
+                    .get_unchecked_mut(head_idx as usize)
+                    .set_prev(Some(entry_idx))
+            }
             self.head = Some(entry_idx);
         } else {
             // when list is currently empty, ensure that both node pointers are null
