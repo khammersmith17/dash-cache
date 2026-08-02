@@ -6,6 +6,7 @@ use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 
 // wrap CacheShard in RwLock for better type semantics
@@ -31,6 +32,31 @@ where
         let cache: SlabShard<K, V, S> = SlabShard::with_capacity_and_hasher(cap, hasher);
         let handle = RwLock::new(cache);
         LockedCache { handle }
+    }
+
+    fn with_capacity_and_hasher_and_default_ttl(
+        cap: NonZeroUsize,
+        hasher: S,
+        default_ttl: Duration,
+    ) -> LockedCache<K, V, S> {
+        let cache = SlabShard::with_capacity_and_hasher_and_default_ttl(cap, hasher, default_ttl);
+        let handle = RwLock::new(cache);
+        LockedCache { handle }
+    }
+
+    async fn insert_with_ttl(&self, key: K, value: V, ttl: Duration) {
+        let mut guard = self.handle.write().await;
+        guard.insert_with_ttl(key, value, ttl);
+    }
+
+    async fn update_with_ttl<Q>(&self, key: &Q, value: V, ttl: Duration) -> Result<(), CacheError>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let mut guard = self.handle.write().await;
+        guard.update_with_ttl(key, value, ttl)?;
+        Ok(())
     }
 
     async fn len(&self) -> usize {
@@ -113,6 +139,7 @@ where
     cap: NonZeroUsize,
     num_shards: Option<NonZeroUsize>,
     hasher: S,
+    default_ttl: Option<Duration>,
     _type_marker: PhantomData<(K, V)>,
 }
 
@@ -130,6 +157,7 @@ where
             cap: capacity,
             num_shards: None,
             hasher: ahash::RandomState::new(),
+            default_ttl: None,
             _type_marker: PhantomData,
         }
     }
@@ -149,6 +177,13 @@ where
         self
     }
 
+    /// Sets a default TTL applied to every entry inserted via [`DashCache::insert`]. Entries
+    /// inserted via [`DashCache::insert_with_ttl`] override this per-call.
+    pub fn with_default_ttl(mut self, ttl: Duration) -> DashCacheBuilder<K, V, S> {
+        self.default_ttl = Some(ttl);
+        self
+    }
+
     /// Replaces the hasher, retyping the builder. Any state set before this call (capacity,
     /// num_shards) is preserved. Because this changes the `S` type parameter, the returned builder
     /// is `DashCacheBuilder<K, V, H>` rather than `DashCacheBuilder<K, V, S>`.
@@ -156,12 +191,13 @@ where
     /// The hasher must implement `Clone` because each shard receives its own clone of the state.
     pub fn with_hasher<H: BuildHasher + Clone>(self, hasher: H) -> DashCacheBuilder<K, V, H> {
         let DashCacheBuilder {
-            cap, num_shards, ..
+            cap, num_shards, default_ttl, ..
         } = self;
         DashCacheBuilder {
             cap,
             num_shards,
             hasher,
+            default_ttl,
             _type_marker: PhantomData,
         }
     }
@@ -176,19 +212,23 @@ where
             cap,
             num_shards,
             hasher,
+            default_ttl,
             ..
         } = self;
-        match num_shards {
+        let inner = match num_shards {
             Some(n) => {
                 let shard_capacity = (cap.get() as f64 / n.get() as f64).ceil() as usize;
-                // safety: given cap
-                DashCache::with_num_shards_and_capacity_and_hasher(
+                InnerCacheShards::with_num_shards_and_capacity_and_hasher(
                     n,
                     NonZeroUsize::new(shard_capacity).unwrap(),
                     hasher,
+                    default_ttl,
                 )
             }
-            None => DashCache::new_with_hasher(cap, hasher),
+            None => InnerCacheShards::new_with_hasher(cap, hasher, default_ttl),
+        };
+        DashCache {
+            inner: Arc::new(inner),
         }
     }
 }
@@ -249,7 +289,7 @@ where
     /// Shard capacity is `ceil(cap / cpu_count)`, with a minimum of 1. If `cap` is not evenly
     /// divisible the total capacity will be slightly above `cap`.
     pub fn new_with_hasher(cap: NonZeroUsize, hasher: S) -> DashCache<K, V, S> {
-        let inner = Arc::new(InnerCacheShards::<K, V, S>::new_with_hasher(cap, hasher));
+        let inner = Arc::new(InnerCacheShards::<K, V, S>::new_with_hasher(cap, hasher, None));
 
         DashCache { inner }
     }
@@ -266,6 +306,7 @@ where
             num_shards,
             shard_capacity,
             hasher,
+            None,
         ));
 
         DashCache { inner }
@@ -288,6 +329,27 @@ where
     /// entry is evicted. Acquires a write lock on the key's shard.
     pub async fn insert(&self, key: K, value: V) {
         self.inner.insert(key, value).await;
+    }
+
+    /// Inserts a key-value pair with an explicit TTL, overriding any default TTL set on the cache.
+    pub async fn insert_with_ttl(&self, key: K, value: V, ttl: Duration) {
+        self.inner.insert_with_ttl(key, value, ttl).await;
+    }
+
+    /// Updates the value for an existing key with an explicit TTL and promotes it to most recently
+    /// used within its shard. Returns `Err(CacheError::KeyNotExist)` if the key is not present.
+    pub async fn update_with_ttl<Q>(
+        &self,
+        key: &Q,
+        value: V,
+        ttl: Duration,
+    ) -> Result<(), CacheError>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.inner.update_with_ttl(key, value, ttl).await?;
+        Ok(())
     }
 
     /// Returns `true` if the key exists in the cache without promoting it or recording a hit.
@@ -369,7 +431,11 @@ where
     T: Clone + Send + Sync + 'static,
     S: BuildHasher + Clone,
 {
-    fn new_with_hasher(capacity: NonZeroUsize, hasher: S) -> InnerCacheShards<K, T, S> {
+    fn new_with_hasher(
+        capacity: NonZeroUsize,
+        hasher: S,
+        default_ttl: Option<Duration>,
+    ) -> InnerCacheShards<K, T, S> {
         let cpu_count = num_cpus::get();
 
         let cap = capacity.get();
@@ -381,7 +447,12 @@ where
         let shards_vec: Vec<LockedCache<K, T, S>> = (0..cpu_count)
             .map(|_| {
                 let h = hasher.clone();
-                LockedCache::with_capacity_and_hasher(shard_capacity, h)
+                match default_ttl {
+                    Some(ttl) => {
+                        LockedCache::with_capacity_and_hasher_and_default_ttl(shard_capacity, h, ttl)
+                    }
+                    None => LockedCache::with_capacity_and_hasher(shard_capacity, h),
+                }
             })
             .collect();
 
@@ -398,12 +469,18 @@ where
         num_shards: NonZeroUsize,
         shard_capacity: NonZeroUsize,
         hasher: S,
+        default_ttl: Option<Duration>,
     ) -> InnerCacheShards<K, T, S> {
         let shard_count = num_shards.get();
         let shards_vec: Vec<LockedCache<K, T, S>> = (0..num_shards.get())
             .map(|_| {
                 let h = hasher.clone();
-                LockedCache::with_capacity_and_hasher(shard_capacity, h)
+                match default_ttl {
+                    Some(ttl) => {
+                        LockedCache::with_capacity_and_hasher_and_default_ttl(shard_capacity, h, ttl)
+                    }
+                    None => LockedCache::with_capacity_and_hasher(shard_capacity, h),
+                }
             })
             .collect();
 
@@ -447,6 +524,23 @@ where
         let shard_key = self.compute_shard(&key);
         let shard_cache = &self.cache_shards[shard_key];
         shard_cache.insert(key, value).await;
+    }
+
+    async fn insert_with_ttl(&self, key: K, value: T, ttl: Duration) {
+        let shard_key = self.compute_shard(&key);
+        let shard_cache = &self.cache_shards[shard_key];
+        shard_cache.insert_with_ttl(key, value, ttl).await;
+    }
+
+    async fn update_with_ttl<Q>(&self, key: &Q, value: T, ttl: Duration) -> Result<(), CacheError>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let shard_key = self.compute_shard(key);
+        let shard_cache = &self.cache_shards[shard_key];
+        shard_cache.update_with_ttl(key, value, ttl).await?;
+        Ok(())
     }
 
     fn compute_shard<Q>(&self, key: &Q) -> usize
@@ -806,6 +900,80 @@ mod dash_cache_tests {
         cache.update("hello", 99).await.unwrap();
         assert_eq!(cache.get("hello").await, Some(99));
         assert!(cache.update("missing", 0).await.is_err());
+    }
+
+    // TTL tests
+
+    #[tokio::test]
+    async fn insert_with_ttl_accessible_before_expiry() {
+        let cache = make_cache(10);
+        cache.insert_with_ttl(1, 100, Duration::from_secs(60)).await;
+        assert_eq!(cache.get(&1).await, Some(100));
+        assert!(cache.contains(&1).await);
+    }
+
+    #[tokio::test]
+    async fn insert_with_ttl_expires() {
+        let cache = make_cache(10);
+        cache.insert_with_ttl(1, 100, Duration::from_millis(50)).await;
+        assert_eq!(cache.get(&1).await, Some(100));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(cache.get(&1).await, None);
+        assert!(!cache.contains(&1).await);
+    }
+
+    #[tokio::test]
+    async fn expiration_stat_incremented() {
+        let cache = make_cache(10);
+        cache.insert_with_ttl(1, 100, Duration::from_millis(50)).await;
+        cache.insert_with_ttl(2, 200, Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(cache.get(&1).await, None);
+        assert_eq!(cache.get(&2).await, None);
+        let stats = cache.statistics().await;
+        assert_eq!(stats.expirations, 2);
+        assert_eq!(stats.hits, 0);
+    }
+
+    #[tokio::test]
+    async fn update_with_ttl_resets_expiration() {
+        let cache = make_cache(10);
+        cache.insert_with_ttl(1, 100, Duration::from_millis(50)).await;
+        cache.update_with_ttl(&1, 200, Duration::from_secs(60)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(cache.get(&1).await, Some(200));
+    }
+
+    #[tokio::test]
+    async fn default_ttl_applied_via_builder() {
+        let cache = DashCacheBuilder::<u64, u64>::new(NonZeroUsize::new(40).unwrap())
+            .with_num_shards(NonZeroUsize::new(4).unwrap())
+            .with_default_ttl(Duration::from_millis(50))
+            .build();
+        cache.insert(1, 100).await;
+        assert_eq!(cache.get(&1).await, Some(100));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(cache.get(&1).await, None);
+    }
+
+    #[tokio::test]
+    async fn insert_with_ttl_overrides_default_ttl() {
+        let cache = DashCacheBuilder::<u64, u64>::new(NonZeroUsize::new(40).unwrap())
+            .with_num_shards(NonZeroUsize::new(4).unwrap())
+            .with_default_ttl(Duration::from_millis(50))
+            .build();
+        // explicit long TTL overrides the short default
+        cache.insert_with_ttl(1, 100, Duration::from_secs(60)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(cache.get(&1).await, Some(100));
+    }
+
+    #[tokio::test]
+    async fn no_default_ttl_entries_do_not_expire() {
+        let cache = make_cache(10);
+        cache.insert(1, 100).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(cache.get(&1).await, Some(100));
     }
 
     #[tokio::test]
