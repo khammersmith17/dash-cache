@@ -1,5 +1,6 @@
 pub mod core;
 pub mod dash_cache;
+pub mod guard;
 pub(crate) mod util;
 
 /// This crate implements both an LruCache geared toward single threaded use and also a thread safe

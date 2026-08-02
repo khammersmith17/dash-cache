@@ -1,3 +1,7 @@
+![Crates.io Downloads (recent)](https://img.shields.io/crates/dr/dash_cache) 
+![Crates.io Version](https://img.shields.io/crates/v/dash_cache)
+
+
 # dash-cache
 This repo is an attempt at an efficient LRU cache implementation. There are three implementations I am experimenting with, one geared toward single threaded usage, and two geared toward performant thread safe usage.
 
