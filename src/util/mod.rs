@@ -65,3 +65,123 @@ pub(crate) fn expires_from_ttl(ttl: Option<Duration>) -> u64 {
 pub(crate) fn is_expired(t: u64) -> bool {
     if t == 0_u64 { false } else { t <= now_nanos() }
 }
+
+#[cfg(test)]
+mod pointer_idx_tests {
+    use super::pointer_idx::*;
+
+    #[test]
+    fn null_neighbors_both_none() {
+        let ptr = null_neighbors();
+        assert_eq!(get_next_pointer(ptr), None);
+        assert_eq!(get_prev_pointer(ptr), None);
+    }
+
+    #[test]
+    fn null_neighbors_is_u64_max() {
+        assert_eq!(null_neighbors(), u64::MAX);
+    }
+
+    #[test]
+    fn set_and_get_next_some() {
+        let ptr = null_neighbors();
+        let ptr = set_next_pointer(ptr, Some(42));
+        assert_eq!(get_next_pointer(ptr), Some(42));
+        // prev must be unaffected
+        assert_eq!(get_prev_pointer(ptr), None);
+    }
+
+    #[test]
+    fn set_and_get_prev_some() {
+        let ptr = null_neighbors();
+        let ptr = set_prev_pointer(ptr, Some(99));
+        assert_eq!(get_prev_pointer(ptr), Some(99));
+        // next must be unaffected
+        assert_eq!(get_next_pointer(ptr), None);
+    }
+
+    #[test]
+    fn set_both_independently() {
+        let ptr = null_neighbors();
+        let ptr = set_next_pointer(ptr, Some(7));
+        let ptr = set_prev_pointer(ptr, Some(13));
+        assert_eq!(get_next_pointer(ptr), Some(7));
+        assert_eq!(get_prev_pointer(ptr), Some(13));
+    }
+
+    #[test]
+    fn set_next_does_not_clobber_prev() {
+        let ptr = null_neighbors();
+        let ptr = set_prev_pointer(ptr, Some(5));
+        let ptr = set_next_pointer(ptr, Some(10));
+        assert_eq!(get_prev_pointer(ptr), Some(5));
+        assert_eq!(get_next_pointer(ptr), Some(10));
+    }
+
+    #[test]
+    fn set_prev_does_not_clobber_next() {
+        let ptr = null_neighbors();
+        let ptr = set_next_pointer(ptr, Some(20));
+        let ptr = set_prev_pointer(ptr, Some(30));
+        assert_eq!(get_next_pointer(ptr), Some(20));
+        assert_eq!(get_prev_pointer(ptr), Some(30));
+    }
+
+    #[test]
+    fn clear_next_to_none() {
+        let ptr = null_neighbors();
+        let ptr = set_next_pointer(ptr, Some(100));
+        let ptr = set_next_pointer(ptr, None);
+        assert_eq!(get_next_pointer(ptr), None);
+    }
+
+    #[test]
+    fn clear_prev_to_none() {
+        let ptr = null_neighbors();
+        let ptr = set_prev_pointer(ptr, Some(200));
+        let ptr = set_prev_pointer(ptr, None);
+        assert_eq!(get_prev_pointer(ptr), None);
+    }
+
+    #[test]
+    fn max_valid_index() {
+        // u32::MAX is the sentinel; u32::MAX - 1 is the largest valid index
+        let max_idx = VALID_FLAG - 1;
+        let ptr = null_neighbors();
+        let ptr = set_next_pointer(ptr, Some(max_idx));
+        let ptr = set_prev_pointer(ptr, Some(max_idx));
+        assert_eq!(get_next_pointer(ptr), Some(max_idx));
+        assert_eq!(get_prev_pointer(ptr), Some(max_idx));
+    }
+
+    #[test]
+    fn zero_index_roundtrips() {
+        let ptr = null_neighbors();
+        let ptr = set_next_pointer(ptr, Some(0));
+        let ptr = set_prev_pointer(ptr, Some(0));
+        assert_eq!(get_next_pointer(ptr), Some(0));
+        assert_eq!(get_prev_pointer(ptr), Some(0));
+    }
+
+    #[test]
+    fn overwrite_next_preserves_prev() {
+        let ptr = null_neighbors();
+        let ptr = set_next_pointer(ptr, Some(1));
+        let ptr = set_prev_pointer(ptr, Some(2));
+        // overwrite next
+        let ptr = set_next_pointer(ptr, Some(99));
+        assert_eq!(get_next_pointer(ptr), Some(99));
+        assert_eq!(get_prev_pointer(ptr), Some(2));
+    }
+
+    #[test]
+    fn overwrite_prev_preserves_next() {
+        let ptr = null_neighbors();
+        let ptr = set_next_pointer(ptr, Some(3));
+        let ptr = set_prev_pointer(ptr, Some(4));
+        // overwrite prev
+        let ptr = set_prev_pointer(ptr, Some(88));
+        assert_eq!(get_next_pointer(ptr), Some(3));
+        assert_eq!(get_prev_pointer(ptr), Some(88));
+    }
+}

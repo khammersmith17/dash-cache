@@ -49,7 +49,6 @@ where
         };
 
         let Some(key) = self.key.take() else { return };
-
         let cache = self.cache.clone();
 
         let Ok(handle) = Handle::try_current() else {
@@ -61,3 +60,4 @@ where
         handle.spawn(async move { cache.insert(key, value).await });
     }
 }
+
