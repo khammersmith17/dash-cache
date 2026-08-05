@@ -9,6 +9,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
+fn default_shard_count() -> usize {
+    num_cpus::get() * 8
+}
+
 // wrap CacheShard in RwLock for better type semantics
 #[derive(Debug)]
 struct LockedCache<K, V, S = ahash::RandomState>
@@ -441,15 +445,14 @@ where
         hasher: S,
         default_ttl: Option<Duration>,
     ) -> InnerCacheShards<K, T, S> {
-        let cpu_count = num_cpus::get();
-
+        let shard_count = default_shard_count();
         let cap = capacity.get();
 
         let shard_capacity =
-            NonZeroUsize::new(((cap as f32 / cpu_count as f32).ceil() as usize).max(1_usize))
+            NonZeroUsize::new(((cap as f32 / shard_count as f32).ceil() as usize).max(1_usize))
                 .unwrap();
 
-        let shards_vec: Vec<LockedCache<K, T, S>> = (0..cpu_count)
+        let shards_vec: Vec<LockedCache<K, T, S>> = (0..shard_count)
             .map(|_| {
                 let h = hasher.clone();
                 match default_ttl {
@@ -464,7 +467,7 @@ where
             .collect();
 
         let cache_shards = shards_vec.into_boxed_slice();
-        let num_shards = unsafe { NonZeroUsize::new_unchecked(cpu_count) };
+        let num_shards = unsafe { NonZeroUsize::new_unchecked(shard_count) };
 
         InnerCacheShards {
             cache_shards,
