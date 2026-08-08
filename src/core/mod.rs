@@ -8,6 +8,12 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 use thiserror::Error;
 
+pub(crate) enum GetResult<V: Clone> {
+    Hit(V, u32),
+    Miss,
+    Expired(u32),
+}
+
 #[derive(Debug, Error)]
 pub enum CacheError {
     #[error("Key does not exist in cache")]
@@ -332,6 +338,10 @@ where
         util::expires_from_ttl(self.default_ttl)
     }
 
+    pub(crate) fn get_key_from_entry_position(&self, entry_idx: u32) -> K {
+        unsafe { self.slab.get_unchecked(entry_idx as usize).key.clone() }
+    }
+
     /// Removes the entry for the given key and returns its value, or `None` if the key is not
     /// present. Does not count as a miss in statistics.
     ///
@@ -342,11 +352,11 @@ where
         K: std::borrow::Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let (_, v) = self.evict_full_entry(key)?;
+        let (_, v, _) = self.evict_full_entry(key)?;
         Some(v)
     }
 
-    pub(crate) fn evict_full_entry<Q>(&mut self, key: &Q) -> Option<(K, V)>
+    pub(crate) fn evict_full_entry<Q>(&mut self, key: &Q) -> Option<(K, V, u64)>
     where
         K: std::borrow::Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -355,7 +365,7 @@ where
         Some(self.evict_entry(entry_idx))
     }
 
-    fn evict_entry(&mut self, entry_idx: u32) -> (K, V) {
+    pub fn evict_entry(&mut self, entry_idx: u32) -> (K, V, u64) {
         self.unlink_node(entry_idx);
 
         #[cfg(debug_assertions)]
@@ -388,11 +398,11 @@ where
             }
         }
 
-        let CacheEntry { key, value, .. } = self.slab.swap_remove(entry_idx as usize);
-        (key, value)
+        let CacheEntry { key, value, expires, .. } = self.slab.swap_remove(entry_idx as usize);
+        (key, value, expires)
     }
 
-    fn evict_from_idx(&mut self, entry_idx: u32) {
+    pub(crate) fn evict_from_idx(&mut self, entry_idx: u32) {
         let key = unsafe { &self.slab.get_unchecked(entry_idx as usize).key };
         let _ = self.node_map.remove(key);
         let _ = self.evict_entry(entry_idx);
@@ -412,6 +422,10 @@ where
 
     pub fn insert_with_ttl(&mut self, key: K, value: V, ttl: Duration) {
         let _ = self.insert_entry(key, value, util::expires_from_ttl(Some(ttl)));
+    }
+
+    pub(crate) fn insert_with_expires(&mut self, key: K, value: V, expires: u64) {
+        let _ = self.insert_entry(key, value, expires);
     }
 
     /// Inserts a key-value pair into the cache.
@@ -623,27 +637,26 @@ where
         self.get_and_promote(*entry_idx_ref)
     }
 
-    pub(crate) fn get_no_promote<Q>(&self, key: &Q) -> Option<(V, u32)>
+    pub(crate) fn get_no_promote<Q>(&self, key: &Q) -> GetResult<V>
     where
         K: std::borrow::Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
         let Some(entry_idx_ref) = self.node_map.get(key) else {
             self.stats.miss();
-            return None;
+            return GetResult::Miss;
         };
 
         let entry_idx = *entry_idx_ref;
 
         if !self.is_entry_valid(entry_idx) {
             self.stats.expiration();
-            return None;
+            return GetResult::Expired(entry_idx);
         }
         self.stats.hit();
 
         let value = unsafe { self.slab.get_unchecked(entry_idx as usize).value.clone() };
-
-        Some((value, entry_idx))
+        GetResult::Hit(value, entry_idx)
     }
 
     fn get_and_promote(&mut self, entry_idx: u32) -> Option<V> {

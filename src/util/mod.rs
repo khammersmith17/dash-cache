@@ -2,7 +2,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::Instant;
 
-pub static CACHE_START: OnceLock<Instant> = OnceLock::new();
+static CACHE_START: OnceLock<Instant> = OnceLock::new();
 
 pub(crate) mod pointer_idx {
 

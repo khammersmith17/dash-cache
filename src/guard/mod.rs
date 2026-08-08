@@ -11,6 +11,7 @@ where
 {
     key: Option<K>,
     value: Option<V>,
+    expires: u64,
     cache: DashCache<K, V, S>,
 }
 
@@ -20,10 +21,11 @@ where
     V: Clone + Send + Sync + 'static,
     S: BuildHasher + Clone + Send + Sync + 'static,
 {
-    pub(crate) fn new(key: K, value: V, cache: DashCache<K, V, S>) -> CacheEntryGuard<K, V, S> {
+    pub(crate) fn new(key: K, value: V, expires: u64, cache: DashCache<K, V, S>) -> CacheEntryGuard<K, V, S> {
         CacheEntryGuard {
             key: Some(key),
             value: Some(value),
+            expires,
             cache,
         }
     }
@@ -64,6 +66,7 @@ where
         };
 
         let Some(key) = self.key.take() else { return };
+        let expires = self.expires;
         let cache = self.cache.clone();
 
         let Ok(handle) = Handle::try_current() else {
@@ -72,7 +75,7 @@ where
             )
         };
 
-        handle.spawn(async move { cache.insert(key, value).await });
+        handle.spawn(async move { cache.insert_with_expires(key, value, expires).await });
     }
 }
 

@@ -1,6 +1,6 @@
-use crate::core::{CacheError, SlabShard};
+use crate::core::{CacheError, GetResult, SlabShard};
 use crate::guard::CacheEntryGuard;
-use crate::queue::PromotionQueue;
+use crate::queue::{self, CacheQueue};
 use crate::stats::{AtomicStats, CacheStats};
 use ahash::AHasher;
 use futures::stream::{self, StreamExt};
@@ -34,11 +34,45 @@ where
     S: BuildHasher + Send + Sync,
 {
     shard: SlabShard<K, V, S, AtomicStats>,
-    buffer: PromotionQueue,
+    promotion: CacheQueue,
+    eviction: CacheQueue,
+    eviction_keys: Vec<K>,
+}
+
+impl<K, V, S> Slab<K, V, S>
+where
+    K: Hash + Ord + Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Send + Sync,
+{
+    fn new(shard: SlabShard<K, V, S, AtomicStats>) -> Slab<K, V, S> {
+        Slab {
+            promotion: CacheQueue::default(),
+            eviction: CacheQueue::default(),
+            eviction_keys: Vec::with_capacity(queue::BUFFER_SIZE),
+            shard,
+        }
+    }
 }
 
 fn default_shard_count() -> usize {
     num_cpus::get() * 8
+}
+
+fn perform_cleanup<K, V, S, I>(
+    promotions: I,
+    evictions: I,
+    slab: &mut SlabShard<K, V, S, AtomicStats>,
+    keys: &mut Vec<K>,
+) where
+    K: Hash + Ord + Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Send + Sync,
+    I: Iterator<Item = u32>,
+{
+    // Perform promotions first, so entries are not invalidated by eviction.
+    promote_on_writes(promotions, slab);
+    evict_on_writes(evictions, slab, keys);
 }
 
 fn promote_on_writes<K, V, S, I>(promotions: I, slab: &mut SlabShard<K, V, S, AtomicStats>)
@@ -50,6 +84,40 @@ where
 {
     for entry in promotions {
         slab.promote(entry);
+    }
+}
+
+fn evict_on_writes<K, V, S, I>(
+    evictions: I,
+    slab: &mut SlabShard<K, V, S, AtomicStats>,
+    keys: &mut Vec<K>,
+) where
+    K: Hash + Ord + Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Send + Sync,
+    I: Iterator<Item = u32>,
+{
+    /*
+     * Eviction can invalidate other entries in the slab, thus we first need to resolve the keys so
+     * the entry indexes can be resolved through a lookup in the map. Otherwise there is a risk of
+     * removing entries that have been moved, but not expired.
+     *
+     * Thus, the keys need to first be resolved before any mutation occurs, then evict is performed
+     * using the key.
+     * */
+    keys.clear();
+    for entry in evictions {
+        let key = slab.get_key_from_entry_position(entry);
+        // The same key may be queued twice for eviction. Only want to duplicate unique keys.
+        // This O(n) contains is cheap as this vec will be at most BUFFER_SIZE.
+        if keys.contains(&key) {
+            continue;
+        }
+        keys.push(key);
+    }
+
+    for key in keys {
+        slab.evict(&key);
     }
 }
 
@@ -66,7 +134,7 @@ where
 
 // wrapper methods around the CacheShard shard internal to a shard
 // This level on the type abstraction contains all concurrency primitives present in the type
-// All write operations flush the shards promotion buffer, as explained above, to amortize the cost
+// All write operations flush the shards promotion promotion, as explained above, to amortize the cost
 // of promotion on a read.
 impl<K, V, S> LockedCache<K, V, S>
 where
@@ -77,10 +145,7 @@ where
     fn with_capacity_and_hasher(cap: NonZeroUsize, hasher: S) -> LockedCache<K, V, S> {
         let shard: SlabShard<K, V, S, AtomicStats> =
             SlabShard::with_capacity_and_hasher(cap, hasher);
-        let handle = RwLock::new(Slab {
-            buffer: PromotionQueue::default(),
-            shard,
-        });
+        let handle = RwLock::new(Slab::new(shard));
         LockedCache { handle }
     }
 
@@ -91,10 +156,7 @@ where
     ) -> LockedCache<K, V, S> {
         let shard: SlabShard<K, V, S, AtomicStats> =
             SlabShard::with_capacity_and_hasher_and_default_ttl(cap, hasher, default_ttl);
-        let handle = RwLock::new(Slab {
-            buffer: PromotionQueue::default(),
-            shard,
-        });
+        let handle = RwLock::new(Slab::new(shard));
 
         LockedCache { handle }
     }
@@ -102,30 +164,44 @@ where
     async fn insert_with_ttl(&self, key: K, value: V, ttl: Duration) {
         let mut guard = self.handle.write().await;
         let Slab {
-            ref mut buffer,
+            ref mut promotion,
             ref mut shard,
+            ref mut eviction,
+            ref mut eviction_keys,
         } = *guard;
-
-        let entries = buffer.drain();
-        promote_on_writes(entries, shard);
+        perform_cleanup(promotion.drain(), eviction.drain(), shard, eviction_keys);
         shard.insert_with_ttl(key, value, ttl);
     }
 
-    async fn checkout<Q>(&self, key: &Q) -> Option<(K, V)>
+    async fn checkout<Q>(&self, key: &Q) -> Option<(K, V, u64)>
     where
         K: std::borrow::Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
         let mut guard = self.handle.write().await;
         let Slab {
+            ref mut promotion,
             ref mut shard,
-            ref mut buffer,
+            ref mut eviction,
+            ref mut eviction_keys,
         } = *guard;
+
         // This is not a write operation, but does take a write lock.
         // Given the held write lock, any reads are promoted.
-        let entries = buffer.drain();
-        promote_on_writes(entries, shard);
+        perform_cleanup(promotion.drain(), eviction.drain(), shard, eviction_keys);
         shard.evict_full_entry(key)
+    }
+
+    async fn insert_with_expires(&self, key: K, value: V, expires: u64) {
+        let mut guard = self.handle.write().await;
+        let Slab {
+            ref mut promotion,
+            ref mut shard,
+            ref mut eviction,
+            ref mut eviction_keys,
+        } = *guard;
+        perform_cleanup(promotion.drain(), eviction.drain(), shard, eviction_keys);
+        shard.insert_with_expires(key, value, expires);
     }
 
     async fn update_with_ttl<Q>(&self, key: &Q, value: V, ttl: Duration) -> Result<(), CacheError>
@@ -135,11 +211,12 @@ where
     {
         let mut guard = self.handle.write().await;
         let Slab {
-            ref mut buffer,
+            ref mut promotion,
             ref mut shard,
+            ref mut eviction,
+            ref mut eviction_keys,
         } = *guard;
-        let entries = buffer.drain();
-        promote_on_writes(entries, shard);
+        perform_cleanup(promotion.drain(), eviction.drain(), shard, eviction_keys);
         shard.update_with_ttl(key, value, ttl)?;
 
         Ok(())
@@ -154,22 +231,24 @@ where
     async fn insert(&self, key: K, value: V) {
         let mut guard = self.handle.write().await;
         let Slab {
+            ref mut promotion,
             ref mut shard,
-            ref mut buffer,
+            ref mut eviction,
+            ref mut eviction_keys,
         } = *guard;
-        let entries = buffer.drain();
-        promote_on_writes(entries, shard);
+        perform_cleanup(promotion.drain(), eviction.drain(), shard, eviction_keys);
         shard.insert(key, value)
     }
 
     async fn drain(&self) {
         let mut guard = self.handle.write().await;
         let Slab {
+            ref mut promotion,
             ref mut shard,
-            ref mut buffer,
+            ref mut eviction,
+            ref mut eviction_keys,
         } = *guard;
-        let entries = buffer.drain();
-        promote_on_writes(entries, shard);
+        perform_cleanup(promotion.drain(), eviction.drain(), shard, eviction_keys);
         shard.drain();
     }
 
@@ -187,13 +266,21 @@ where
         let guard = self.handle.read().await;
         let Slab {
             ref shard,
-            ref buffer,
+            ref promotion,
+            ref eviction,
+            ..
         } = *guard;
-        let Some((v, entry_idx)) = shard.get_no_promote(key) else {
-            return None;
-        };
-        buffer.push(entry_idx);
-        Some(v)
+        match shard.get_no_promote(key) {
+            GetResult::Miss => None,
+            GetResult::Hit(v, entry_idx) => {
+                promotion.push(entry_idx);
+                Some(v)
+            }
+            GetResult::Expired(entry_idx) => {
+                eviction.push(entry_idx);
+                None
+            }
+        }
     }
 
     async fn evict<Q>(&self, key: &Q) -> Option<V>
@@ -204,10 +291,11 @@ where
         let mut guard = self.handle.write().await;
         let Slab {
             ref mut shard,
-            ref mut buffer,
+            ref mut promotion,
+            ref mut eviction,
+            ref mut eviction_keys,
         } = *guard;
-        let entries = buffer.drain();
-        promote_on_writes(entries, shard);
+        perform_cleanup(promotion.drain(), eviction.drain(), shard, eviction_keys);
         shard.evict(key)
     }
 
@@ -219,10 +307,12 @@ where
         let mut guard = self.handle.write().await;
         let Slab {
             ref mut shard,
-            ref mut buffer,
+            ref mut promotion,
+            ref mut eviction,
+            ref mut eviction_keys,
         } = *guard;
-        let entries = buffer.drain();
-        promote_on_writes(entries, shard);
+        perform_cleanup(promotion.drain(), eviction.drain(), shard, eviction_keys);
+
         shard.update(key, value)?;
         Ok(())
     }
@@ -518,8 +608,12 @@ where
         K: std::borrow::Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let (key, value) = self.inner.checkout(key).await?;
-        Some(CacheEntryGuard::new(key, value, self.clone()))
+        let (key, value, expires) = self.inner.checkout(key).await?;
+        Some(CacheEntryGuard::new(key, value, expires, self.clone()))
+    }
+
+    pub(crate) async fn insert_with_expires(&self, key: K, value: V, expires: u64) {
+        self.inner.insert_with_expires(key, value, expires).await;
     }
 
     /// Returns whether the entire cache is empty.
@@ -634,7 +728,7 @@ where
         }
     }
 
-    async fn checkout<Q>(&self, key: &Q) -> Option<(K, T)>
+    async fn checkout<Q>(&self, key: &Q) -> Option<(K, T, u64)>
     where
         K: std::borrow::Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -645,6 +739,12 @@ where
         let shard_key = self.compute_shard(key);
         let shard_cache = &self.cache_shards[shard_key];
         shard_cache.checkout(key).await
+    }
+
+    async fn insert_with_expires(&self, key: K, value: T, expires: u64) {
+        let shard_key = self.compute_shard(&key);
+        let shard_cache = &self.cache_shards[shard_key];
+        shard_cache.insert_with_expires(key, value, expires).await;
     }
 
     async fn len(&self) -> usize {
@@ -1229,5 +1329,31 @@ mod dash_cache_tests {
         tokio::task::yield_now().await;
         // guard re-inserted the original value, overwriting the interim insert
         assert_eq!(cache.get(&1).await, Some(100));
+    }
+
+    #[tokio::test]
+    async fn checkout_drop_preserves_ttl() {
+        // The entry should be re-inserted with its original expiry, not a fresh TTL.
+        let cache = DashCache::with_num_shards_and_capacity(
+            NonZeroUsize::new(4).unwrap(),
+            NonZeroUsize::new(10).unwrap(),
+        );
+        let ttl = Duration::from_millis(200);
+        cache.insert_with_ttl(1u64, 100u64, ttl).await;
+
+        // Wait for half the TTL, then check out.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let guard = cache.checkout(&1u64).await.unwrap();
+        drop(guard);
+        tokio::task::yield_now().await;
+
+        // Still within the original TTL window — entry should be present.
+        assert_eq!(cache.get(&1u64).await, Some(100));
+
+        // Wait for the remainder of the original TTL to elapse.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // The entry should now be expired (original expiry has passed).
+        assert_eq!(cache.get(&1u64).await, None);
     }
 }

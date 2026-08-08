@@ -1,5 +1,4 @@
-#![allow(warnings)]
-
+#![deny(warnings)]
 pub mod core;
 pub mod dash_cache;
 pub mod guard;
