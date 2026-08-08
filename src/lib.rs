@@ -1,9 +1,9 @@
 #![allow(warnings)]
 
-pub(crate) mod buffer;
 pub mod core;
 pub mod dash_cache;
 pub mod guard;
+pub(crate) mod queue;
 pub mod stats;
 pub(crate) mod util;
 

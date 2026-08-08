@@ -4,23 +4,23 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 const BUFFER_SIZE: usize = 64_usize;
 
 #[derive(Debug)]
-pub(crate) struct PromotionBuffer {
+pub(crate) struct PromotionQueue {
     buffer: UnsafeCell<[u32; BUFFER_SIZE]>,
     head: usize,
     tail: AtomicUsize,
     full: AtomicBool,
 }
 
-unsafe impl Send for PromotionBuffer {}
-unsafe impl Sync for PromotionBuffer {}
+unsafe impl Send for PromotionQueue {}
+unsafe impl Sync for PromotionQueue {}
 
-impl Default for PromotionBuffer {
-    fn default() -> PromotionBuffer {
+impl Default for PromotionQueue {
+    fn default() -> PromotionQueue {
         let buffer = UnsafeCell::new([u32::MAX; BUFFER_SIZE]);
         let head = 0_usize;
         let tail = AtomicUsize::new(0_usize);
         let full = AtomicBool::new(false);
-        PromotionBuffer {
+        PromotionQueue {
             buffer,
             head,
             tail,
@@ -29,7 +29,8 @@ impl Default for PromotionBuffer {
     }
 }
 
-impl PromotionBuffer {
+impl PromotionQueue {
+    // Push
     pub(crate) fn push(&self, idx: u32) {
         if self.full.load(Ordering::Acquire) {
             return;
@@ -61,4 +62,3 @@ impl PromotionBuffer {
         entries
     }
 }
-

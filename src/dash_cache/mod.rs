@@ -1,6 +1,6 @@
-use crate::buffer::PromotionBuffer;
 use crate::core::{CacheError, SlabShard};
 use crate::guard::CacheEntryGuard;
+use crate::queue::PromotionQueue;
 use crate::stats::{AtomicStats, CacheStats};
 use ahash::AHasher;
 use futures::stream::{self, StreamExt};
@@ -33,7 +33,7 @@ where
     S: BuildHasher + Send + Sync,
 {
     shard: SlabShard<K, V, S, AtomicStats>,
-    buffer: PromotionBuffer,
+    buffer: PromotionQueue,
 }
 
 fn default_shard_count() -> usize {
@@ -76,7 +76,7 @@ where
         let shard: SlabShard<K, V, S, AtomicStats> =
             SlabShard::with_capacity_and_hasher(cap, hasher);
         let handle = RwLock::new(Slab {
-            buffer: PromotionBuffer::default(),
+            buffer: PromotionQueue::default(),
             shard,
         });
         LockedCache { handle }
@@ -90,7 +90,7 @@ where
         let shard: SlabShard<K, V, S, AtomicStats> =
             SlabShard::with_capacity_and_hasher_and_default_ttl(cap, hasher, default_ttl);
         let handle = RwLock::new(Slab {
-            buffer: PromotionBuffer::default(),
+            buffer: PromotionQueue::default(),
             shard,
         });
 
