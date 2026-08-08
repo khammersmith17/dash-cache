@@ -6,6 +6,7 @@ use ahash::AHasher;
 use futures::stream::{self, StreamExt};
 use std::hash::Hasher;
 use std::hash::{BuildHasher, Hash};
+use std::iter::Iterator;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -40,14 +41,15 @@ fn default_shard_count() -> usize {
     num_cpus::get() * 8
 }
 
-fn promote_on_writes<K, V, S>(promotions: &[u32], slab: &mut SlabShard<K, V, S, AtomicStats>)
+fn promote_on_writes<K, V, S, I>(promotions: I, slab: &mut SlabShard<K, V, S, AtomicStats>)
 where
     K: Hash + Ord + Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
     S: BuildHasher + Send + Sync,
+    I: Iterator<Item = u32>,
 {
     for entry in promotions {
-        slab.promote(*entry);
+        slab.promote(entry);
     }
 }
 
@@ -105,7 +107,7 @@ where
         } = *guard;
 
         let entries = buffer.drain();
-        promote_on_writes(&entries, shard);
+        promote_on_writes(entries, shard);
         shard.insert_with_ttl(key, value, ttl);
     }
 
@@ -122,7 +124,7 @@ where
         // This is not a write operation, but does take a write lock.
         // Given the held write lock, any reads are promoted.
         let entries = buffer.drain();
-        promote_on_writes(&entries, shard);
+        promote_on_writes(entries, shard);
         shard.evict_full_entry(key)
     }
 
@@ -137,7 +139,7 @@ where
             ref mut shard,
         } = *guard;
         let entries = buffer.drain();
-        promote_on_writes(&entries, shard);
+        promote_on_writes(entries, shard);
         shard.update_with_ttl(key, value, ttl)?;
 
         Ok(())
@@ -156,7 +158,7 @@ where
             ref mut buffer,
         } = *guard;
         let entries = buffer.drain();
-        promote_on_writes(&entries, shard);
+        promote_on_writes(entries, shard);
         shard.insert(key, value)
     }
 
@@ -167,7 +169,7 @@ where
             ref mut buffer,
         } = *guard;
         let entries = buffer.drain();
-        promote_on_writes(&entries, shard);
+        promote_on_writes(entries, shard);
         shard.drain();
     }
 
@@ -205,7 +207,7 @@ where
             ref mut buffer,
         } = *guard;
         let entries = buffer.drain();
-        promote_on_writes(&entries, shard);
+        promote_on_writes(entries, shard);
         shard.evict(key)
     }
 
@@ -220,7 +222,7 @@ where
             ref mut buffer,
         } = *guard;
         let entries = buffer.drain();
-        promote_on_writes(&entries, shard);
+        promote_on_writes(entries, shard);
         shard.update(key, value)?;
         Ok(())
     }
