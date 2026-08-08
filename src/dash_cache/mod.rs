@@ -1,4 +1,7 @@
-use crate::core::{CacheError, CacheStats, SlabShard};
+use crate::buffer::PromotionBuffer;
+use crate::core::{CacheError, SlabShard};
+use crate::guard::CacheEntryGuard;
+use crate::stats::{AtomicStats, CacheStats};
 use ahash::AHasher;
 use futures::stream::{self, StreamExt};
 use std::hash::Hasher;
@@ -9,32 +12,73 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
+// Slab type couples the cache shard and the promotion queue together.
+//
+// On read, the write lock would only be required to perform the promotion of the touched entry.
+// Given this, all reads are queued and the promotion only occurs when the write lock is acquired.
+// This amortizes the cost reads, and eliminates lock contention on read, otherwise the RwLock
+// effectively becomes Mutex. This allows for semantics better inline with read/write locking a
+// critical section.
+//
+// Queued promotions ar fired every call that requires the write lock. Firing them off all
+// sequentially allows for all promotions to be performed with a single write lock acquistion and
+// may improve the cache locality, and potentially lowering the overhead of cache invalidation on
+// other cores, given that all promotions in a single queued batch will result in a single
+// observed cache invalidation on another core, per MESI.
+#[derive(Debug)]
+struct Slab<K, V, S>
+where
+    K: Hash + Ord + Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Send + Sync,
+{
+    shard: SlabShard<K, V, S, AtomicStats>,
+    buffer: PromotionBuffer,
+}
+
 fn default_shard_count() -> usize {
     num_cpus::get() * 8
+}
+
+fn promote_on_writes<K, V, S>(promotions: &[u32], slab: &mut SlabShard<K, V, S, AtomicStats>)
+where
+    K: Hash + Ord + Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Send + Sync,
+{
+    for entry in promotions {
+        slab.promote(*entry);
+    }
 }
 
 // wrap CacheShard in RwLock for better type semantics
 #[derive(Debug)]
 struct LockedCache<K, V, S = ahash::RandomState>
 where
-    K: Hash + Ord + Clone,
-    V: Clone,
-    S: BuildHasher,
+    K: Hash + Ord + Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Send + Sync,
 {
-    handle: RwLock<SlabShard<K, V, S>>,
+    handle: RwLock<Slab<K, V, S>>,
 }
 
 // wrapper methods around the CacheShard shard internal to a shard
 // This level on the type abstraction contains all concurrency primitives present in the type
+// All write operations flush the shards promotion buffer, as explained above, to amortize the cost
+// of promotion on a read.
 impl<K, V, S> LockedCache<K, V, S>
 where
-    K: Hash + Ord + Clone,
-    V: Clone,
-    S: BuildHasher,
+    K: Hash + Ord + Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
 {
     fn with_capacity_and_hasher(cap: NonZeroUsize, hasher: S) -> LockedCache<K, V, S> {
-        let cache: SlabShard<K, V, S> = SlabShard::with_capacity_and_hasher(cap, hasher);
-        let handle = RwLock::new(cache);
+        let shard: SlabShard<K, V, S, AtomicStats> =
+            SlabShard::with_capacity_and_hasher(cap, hasher);
+        let handle = RwLock::new(Slab {
+            buffer: PromotionBuffer::default(),
+            shard,
+        });
         LockedCache { handle }
     }
 
@@ -43,14 +87,43 @@ where
         hasher: S,
         default_ttl: Duration,
     ) -> LockedCache<K, V, S> {
-        let cache = SlabShard::with_capacity_and_hasher_and_default_ttl(cap, hasher, default_ttl);
-        let handle = RwLock::new(cache);
+        let shard: SlabShard<K, V, S, AtomicStats> =
+            SlabShard::with_capacity_and_hasher_and_default_ttl(cap, hasher, default_ttl);
+        let handle = RwLock::new(Slab {
+            buffer: PromotionBuffer::default(),
+            shard,
+        });
+
         LockedCache { handle }
     }
 
     async fn insert_with_ttl(&self, key: K, value: V, ttl: Duration) {
         let mut guard = self.handle.write().await;
-        guard.insert_with_ttl(key, value, ttl);
+        let Slab {
+            ref mut buffer,
+            ref mut shard,
+        } = *guard;
+
+        let entries = buffer.drain();
+        promote_on_writes(&entries, shard);
+        shard.insert_with_ttl(key, value, ttl);
+    }
+
+    async fn checkout<Q>(&self, key: &Q) -> Option<(K, V)>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let mut guard = self.handle.write().await;
+        let Slab {
+            ref mut shard,
+            ref mut buffer,
+        } = *guard;
+        // This is not a write operation, but does take a write lock.
+        // Given the held write lock, any reads are promoted.
+        let entries = buffer.drain();
+        promote_on_writes(&entries, shard);
+        shard.evict_full_entry(key)
     }
 
     async fn update_with_ttl<Q>(&self, key: &Q, value: V, ttl: Duration) -> Result<(), CacheError>
@@ -59,28 +132,49 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let mut guard = self.handle.write().await;
-        guard.update_with_ttl(key, value, ttl)?;
+        let Slab {
+            ref mut buffer,
+            ref mut shard,
+        } = *guard;
+        let entries = buffer.drain();
+        promote_on_writes(&entries, shard);
+        shard.update_with_ttl(key, value, ttl)?;
+
         Ok(())
     }
 
     async fn len(&self) -> usize {
         let guard = self.handle.read().await;
-        guard.len()
+        let Slab { ref shard, .. } = *guard;
+        shard.len()
     }
 
     async fn insert(&self, key: K, value: V) {
         let mut guard = self.handle.write().await;
-        guard.insert(key, value)
+        let Slab {
+            ref mut shard,
+            ref mut buffer,
+        } = *guard;
+        let entries = buffer.drain();
+        promote_on_writes(&entries, shard);
+        shard.insert(key, value)
     }
 
     async fn drain(&self) {
         let mut guard = self.handle.write().await;
-        guard.drain();
+        let Slab {
+            ref mut shard,
+            ref mut buffer,
+        } = *guard;
+        let entries = buffer.drain();
+        promote_on_writes(&entries, shard);
+        shard.drain();
     }
 
     async fn statistics(&self) -> CacheStats {
         let guard = self.handle.read().await;
-        guard.statistics()
+        let Slab { ref shard, .. } = *guard;
+        shard.statistics()
     }
 
     async fn get<Q>(&self, key: &Q) -> Option<V>
@@ -88,8 +182,16 @@ where
         K: std::borrow::Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let mut guard = self.handle.write().await;
-        guard.get(key)
+        let guard = self.handle.read().await;
+        let Slab {
+            ref shard,
+            ref buffer,
+        } = *guard;
+        let Some((v, entry_idx)) = shard.get_no_promote(key) else {
+            return None;
+        };
+        buffer.push(entry_idx);
+        Some(v)
     }
 
     async fn evict<Q>(&self, key: &Q) -> Option<V>
@@ -98,7 +200,13 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let mut guard = self.handle.write().await;
-        guard.evict(key)
+        let Slab {
+            ref mut shard,
+            ref mut buffer,
+        } = *guard;
+        let entries = buffer.drain();
+        promote_on_writes(&entries, shard);
+        shard.evict(key)
     }
 
     async fn update<Q>(&self, key: &Q, value: V) -> Result<(), CacheError>
@@ -107,7 +215,13 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let mut guard = self.handle.write().await;
-        guard.update(key, value)?;
+        let Slab {
+            ref mut shard,
+            ref mut buffer,
+        } = *guard;
+        let entries = buffer.drain();
+        promote_on_writes(&entries, shard);
+        shard.update(key, value)?;
         Ok(())
     }
 
@@ -117,7 +231,8 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let guard = self.handle.read().await;
-        guard.contains(key)
+        let Slab { ref shard, .. } = *guard;
+        shard.contains(key)
     }
 }
 
@@ -138,7 +253,7 @@ pub struct DashCacheBuilder<K, V, S = ahash::RandomState>
 where
     K: Hash + Ord + Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
-    S: BuildHasher + Clone,
+    S: BuildHasher + Clone + Send + Sync,
 {
     cap: NonZeroUsize,
     num_shards: Option<NonZeroUsize>,
@@ -171,7 +286,7 @@ impl<K, V, S> DashCacheBuilder<K, V, S>
 where
     K: Hash + Ord + Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
-    S: BuildHasher + Clone,
+    S: BuildHasher + Clone + Send + Sync,
 {
     /// Sets the number of shards. Per-shard capacity is computed as `ceil(total_cap / num_shards)`
     /// when [`build`](DashCacheBuilder::build) is called, so total capacity may be slightly above
@@ -193,7 +308,10 @@ where
     /// is `DashCacheBuilder<K, V, H>` rather than `DashCacheBuilder<K, V, S>`.
     ///
     /// The hasher must implement `Clone` because each shard receives its own clone of the state.
-    pub fn with_hasher<H: BuildHasher + Clone>(self, hasher: H) -> DashCacheBuilder<K, V, H> {
+    pub fn with_hasher<H: BuildHasher + Clone + Send + Sync>(
+        self,
+        hasher: H,
+    ) -> DashCacheBuilder<K, V, H> {
         let DashCacheBuilder {
             cap,
             num_shards,
@@ -256,7 +374,7 @@ pub struct DashCache<K, V, S = ahash::RandomState>
 where
     K: Hash + Ord + Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
-    S: BuildHasher,
+    S: BuildHasher + Send + Sync + 'static,
 {
     inner: Arc<InnerCacheShards<K, V, S>>,
 }
@@ -289,7 +407,7 @@ impl<K, V, S> DashCache<K, V, S>
 where
     K: Hash + Ord + Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
-    S: BuildHasher + Clone,
+    S: BuildHasher + Clone + Send + Sync,
 {
     /// Creates a `DashCache` with one shard per logical CPU core.
     ///
@@ -393,6 +511,15 @@ where
         self.inner.len().await
     }
 
+    pub async fn checkout<Q>(&self, key: &Q) -> Option<CacheEntryGuard<K, V, S>>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let (key, value) = self.inner.checkout(key).await?;
+        Some(CacheEntryGuard::new(key, value, self.clone()))
+    }
+
     /// Returns whether the entire cache is empty.
     pub async fn is_empty(&self) -> bool {
         self.len().await == 0_usize
@@ -428,7 +555,7 @@ struct InnerCacheShards<K, V, S = ahash::RandomState>
 where
     K: Hash + Ord + Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
-    S: BuildHasher,
+    S: BuildHasher + Send + Sync,
 {
     cache_shards: Box<[LockedCache<K, V, S>]>,
     num_shards: NonZeroUsize,
@@ -438,7 +565,7 @@ impl<K, T, S> InnerCacheShards<K, T, S>
 where
     K: Hash + Ord + Clone + Send + Sync + 'static,
     T: Clone + Send + Sync + 'static,
-    S: BuildHasher + Clone,
+    S: BuildHasher + Clone + Send + Sync + 'static,
 {
     fn new_with_hasher(
         capacity: NonZeroUsize,
@@ -503,6 +630,19 @@ where
             cache_shards,
             num_shards,
         }
+    }
+
+    async fn checkout<Q>(&self, key: &Q) -> Option<(K, T)>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        /*
+         * Evict then return it back
+         * */
+        let shard_key = self.compute_shard(key);
+        let shard_cache = &self.cache_shards[shard_key];
+        shard_cache.checkout(key).await
     }
 
     async fn len(&self) -> usize {
@@ -1017,5 +1157,75 @@ mod dash_cache_tests {
         assert!(cache.len().await <= total_cap);
         let stats = cache.statistics().await;
         assert!(stats.evictions > 0);
+    }
+
+    #[tokio::test]
+    async fn checkout_removes_entry_from_cache() {
+        let cache = make_cache(10);
+        cache.insert(1, 100).await;
+        let guard = cache.checkout(&1).await;
+        assert!(guard.is_some());
+        assert!(!cache.contains(&1).await);
+    }
+
+    #[tokio::test]
+    async fn checkout_miss_returns_none() {
+        let cache = make_cache(10);
+        assert!(cache.checkout(&99u64).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn checkout_deref_returns_value() {
+        let cache = make_cache(10);
+        cache.insert(1, 100u64).await;
+        let guard = cache.checkout(&1).await.unwrap();
+        assert_eq!(*guard, 100);
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn checkout_drop_reinserts_value() {
+        let cache = make_cache(10);
+        cache.insert(1, 100u64).await;
+        let guard = cache.checkout(&1).await.unwrap();
+        drop(guard);
+        // yield to let the spawned re-insert task run
+        tokio::task::yield_now().await;
+        assert_eq!(cache.get(&1).await, Some(100));
+    }
+
+    #[tokio::test]
+    async fn checkout_drop_reinserts_modified_value() {
+        let cache = make_cache(10);
+        cache.insert(1, 100u64).await;
+        let mut guard = cache.checkout(&1).await.unwrap();
+        *guard = 999;
+        drop(guard);
+        tokio::task::yield_now().await;
+        assert_eq!(cache.get(&1).await, Some(999));
+    }
+
+    #[tokio::test]
+    async fn checkout_other_keys_unaffected() {
+        let cache = make_cache(10);
+        cache.insert(1, 100u64).await;
+        cache.insert(2, 200u64).await;
+        let _guard = cache.checkout(&1).await.unwrap();
+        assert_eq!(cache.get(&2).await, Some(200));
+    }
+
+    #[tokio::test]
+    async fn checkout_then_insert_new_value_while_checked_out() {
+        // If the caller re-inserts a new value while the guard is live, the guard's
+        // drop re-inserts the original (checked-out) value, overwriting the interim one.
+        let cache = make_cache(10);
+        cache.insert(1, 100u64).await;
+        let guard = cache.checkout(&1).await.unwrap();
+        cache.insert(1, 777).await;
+        assert_eq!(cache.get(&1).await, Some(777));
+        drop(guard);
+        tokio::task::yield_now().await;
+        // guard re-inserted the original value, overwriting the interim insert
+        assert_eq!(cache.get(&1).await, Some(100));
     }
 }

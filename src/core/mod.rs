@@ -1,3 +1,4 @@
+use crate::stats::{CacheStats, LocalStats, Stats};
 use crate::util;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -11,53 +12,6 @@ use thiserror::Error;
 pub enum CacheError {
     #[error("Key does not exist in cache")]
     KeyNotExist,
-}
-
-#[derive(Default, Debug, Clone)]
-pub struct CacheStats {
-    pub hits: usize,
-    pub misses: usize,
-    pub evictions: usize,
-    pub expirations: usize,
-}
-
-impl std::ops::Add<CacheStats> for CacheStats {
-    type Output = Self;
-    fn add(self, other: Self) -> Self::Output {
-        CacheStats {
-            hits: self.hits + other.hits,
-            misses: self.misses + other.misses,
-            evictions: self.evictions + other.evictions,
-            expirations: self.expirations + other.expirations,
-        }
-    }
-}
-
-impl std::ops::AddAssign<CacheStats> for CacheStats {
-    fn add_assign(&mut self, other: Self) {
-        self.hits += other.hits;
-        self.misses += other.misses;
-        self.evictions += other.evictions;
-        self.expirations += other.expirations;
-    }
-}
-
-impl CacheStats {
-    fn miss(&mut self) {
-        self.misses += 1;
-    }
-
-    fn hit(&mut self) {
-        self.hits += 1;
-    }
-
-    fn eviction(&mut self) {
-        self.evictions += 1
-    }
-
-    fn expiration(&mut self) {
-        self.expirations += 1;
-    }
 }
 
 #[derive(Debug)]
@@ -139,7 +93,7 @@ impl<K: Hash + Ord + Clone, V: Clone, S: BuildHasher> SlabShardBuilder<K, V, S> 
         self
     }
 
-    pub fn build(self) -> SlabShard<K, V, S> {
+    pub fn build(self) -> SlabShard<K, V, S, LocalStats> {
         let Self {
             capacity,
             default_ttl,
@@ -159,52 +113,57 @@ impl<K: Hash + Ord + Clone, V: Clone, S: BuildHasher> SlabShardBuilder<K, V, S> 
             slab: Vec::with_capacity(cap),
             head: None,
             tail: None,
-            stats: CacheStats::default(),
+            stats: LocalStats::default(),
             default_ttl,
         }
     }
 }
 
-/// An unsafe, single-threaded LRU cache backed by a contiguous slab allocation.
+/// An LRU cache backed by a contiguous slab allocation.
 ///
-/// Unlike `CacheShard`, all entries live in a pre-allocated `Vec` and the recency list uses `u32`
-/// slab indices instead of heap pointers. This gives significantly better cache locality,
-/// especially on read-heavy workloads.
+/// All entries live in a pre-allocated `Vec` and the recency list uses `u32` slab indices instead
+/// of heap pointers. This gives significantly better cache locality, especially on read-heavy
+/// workloads.
 ///
-/// This is `Send + Sync` and is the internal shard type used by `DashCache`.
+/// The `St` type parameter controls the statistics backend:
+/// - `LocalStats` (default): uses `Cell<usize>`, zero atomic overhead, `!Sync`.
+/// - `AtomicStats`: uses `AtomicUsize`, `Sync` — used internally by `DashCache`.
 ///
 /// Safety invariants are documented inline and heavily asserted in debug builds. Capacity is
 /// limited to `u32::MAX >> 1` entries, reserving `u32::MAX` as the null pointer sentinel.
 /// All values returned are clones.
 #[derive(Debug)]
-pub struct SlabShard<K, V, S = ahash::RandomState>
+pub struct SlabShard<K, V, S = ahash::RandomState, St = LocalStats>
 where
     K: Hash + Ord + Clone,
     V: Clone,
     S: BuildHasher,
+    St: Stats,
 {
     cap: usize,
     slab: Vec<CacheEntry<K, V>>,
     node_map: HashMap<K, u32, S>,
     head: Option<u32>,
     tail: Option<u32>,
-    stats: CacheStats,
+    stats: St,
     default_ttl: Option<Duration>,
 }
 
-impl<K, V> SlabShard<K, V, ahash::RandomState>
+impl<K, V> SlabShard<K, V, ahash::RandomState, LocalStats>
 where
     K: Hash + Ord + Clone,
     V: Clone,
 {
-    pub fn with_capacity(capacity: NonZeroUsize) -> SlabShard<K, V, ahash::RandomState> {
+    pub fn with_capacity(
+        capacity: NonZeroUsize,
+    ) -> SlabShard<K, V, ahash::RandomState, LocalStats> {
         SlabShard::with_capacity_and_hasher(capacity, ahash::RandomState::new())
     }
 
     pub fn with_capacity_and_default_ttl(
         capacity: NonZeroUsize,
         default_ttl: Duration,
-    ) -> SlabShard<K, V, ahash::RandomState> {
+    ) -> SlabShard<K, V, ahash::RandomState, LocalStats> {
         SlabShard::with_capacity_and_hasher_and_default_ttl(
             capacity,
             ahash::RandomState::new(),
@@ -213,14 +172,18 @@ where
     }
 }
 
-impl<K, V, S> SlabShard<K, V, S>
+impl<K, V, S, St> SlabShard<K, V, S, St>
 where
     K: Hash + Ord + Clone,
     V: Clone,
     S: BuildHasher,
+    St: Stats,
 {
-    /// Creates a new `SlabShard` with the given capacity. Panics if capacity exceeds `u32::MAX`.
-    pub fn with_capacity_and_hasher(capacity: NonZeroUsize, hasher: S) -> SlabShard<K, V, S> {
+    /// Creates a new `SlabShard` with the given capacity. Panics if capacity exceeds `u32::MAX >> 1`.
+    pub fn with_capacity_and_hasher(capacity: NonZeroUsize, hasher: S) -> SlabShard<K, V, S, St>
+    where
+        St: Default,
+    {
         let cap = capacity.get();
         if cap > (u32::MAX >> 1) as usize {
             panic!("capacity must be <= {}", u32::MAX >> 1);
@@ -234,7 +197,7 @@ where
             slab: Vec::with_capacity(cap),
             head: None,
             tail: None,
-            stats: CacheStats::default(),
+            stats: St::default(),
             default_ttl: None,
         }
     }
@@ -243,7 +206,10 @@ where
         capacity: NonZeroUsize,
         hasher: S,
         default_ttl: Duration,
-    ) -> SlabShard<K, V, S> {
+    ) -> SlabShard<K, V, S, St>
+    where
+        St: Default,
+    {
         let cap = capacity.get();
         if cap > (u32::MAX >> 1) as usize {
             panic!("capacity must be <= {}", u32::MAX >> 1);
@@ -257,7 +223,7 @@ where
             slab: Vec::with_capacity(cap),
             head: None,
             tail: None,
-            stats: CacheStats::default(),
+            stats: St::default(),
             default_ttl: Some(default_ttl),
         }
     }
@@ -284,6 +250,15 @@ where
     /// Returns the number of entries currently in the cache.
     pub fn len(&self) -> usize {
         self.slab.len()
+    }
+
+    pub(crate) fn promote(&mut self, entry_idx: u32) {
+        debug_assert!(self.head.is_some());
+        let head_idx = self.head.unwrap();
+        if head_idx != entry_idx {
+            self.unlink_node(entry_idx);
+            self.push_node_to_head(entry_idx);
+        }
     }
 
     // Promotes the entry at `entry_idx` to the head of the recency list and overwrites its value.
@@ -367,11 +342,20 @@ where
         K: std::borrow::Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
+        let (_, v) = self.evict_full_entry(key)?;
+        Some(v)
+    }
+
+    pub(crate) fn evict_full_entry<Q>(&mut self, key: &Q) -> Option<(K, V)>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         let entry_idx = self.node_map.remove(key)?;
         Some(self.evict_entry(entry_idx))
     }
 
-    fn evict_entry(&mut self, entry_idx: u32) -> V {
+    fn evict_entry(&mut self, entry_idx: u32) -> (K, V) {
         self.unlink_node(entry_idx);
 
         #[cfg(debug_assertions)]
@@ -404,8 +388,8 @@ where
             }
         }
 
-        let CacheEntry { value, .. } = self.slab.swap_remove(entry_idx as usize);
-        value
+        let CacheEntry { key, value, .. } = self.slab.swap_remove(entry_idx as usize);
+        (key, value)
     }
 
     fn evict_from_idx(&mut self, entry_idx: u32) {
@@ -427,7 +411,7 @@ where
     }
 
     pub fn insert_with_ttl(&mut self, key: K, value: V, ttl: Duration) {
-        self.insert_entry(key, value, util::expires_from_ttl(Some(ttl)));
+        let _ = self.insert_entry(key, value, util::expires_from_ttl(Some(ttl)));
     }
 
     /// Inserts a key-value pair into the cache.
@@ -639,6 +623,29 @@ where
         self.get_and_promote(*entry_idx_ref)
     }
 
+    pub(crate) fn get_no_promote<Q>(&self, key: &Q) -> Option<(V, u32)>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let Some(entry_idx_ref) = self.node_map.get(key) else {
+            self.stats.miss();
+            return None;
+        };
+
+        let entry_idx = *entry_idx_ref;
+
+        if !self.is_entry_valid(entry_idx) {
+            self.stats.expiration();
+            return None;
+        }
+        self.stats.hit();
+
+        let value = unsafe { self.slab.get_unchecked(entry_idx as usize).value.clone() };
+
+        Some((value, entry_idx))
+    }
+
     fn get_and_promote(&mut self, entry_idx: u32) -> Option<V> {
         if !self.is_entry_valid(entry_idx) {
             self.stats.expiration();
@@ -662,7 +669,7 @@ where
 
     /// Returns a snapshot of cache hit, miss, and eviction counts.
     pub fn statistics(&self) -> CacheStats {
-        self.stats.clone()
+        self.stats.snapshot()
     }
 }
 

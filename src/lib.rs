@@ -1,6 +1,10 @@
+#![allow(warnings)]
+
+pub(crate) mod buffer;
 pub mod core;
 pub mod dash_cache;
 pub mod guard;
+pub mod stats;
 pub(crate) mod util;
 
 /// This crate implements both an LruCache geared toward single threaded use and also a thread safe
@@ -11,3 +15,4 @@ pub(crate) mod util;
 /// data on get and set type methods.
 pub use core::SlabShard;
 pub use dash_cache::DashCache;
+pub use stats::CacheStats;

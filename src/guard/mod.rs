@@ -14,6 +14,21 @@ where
     cache: DashCache<K, V, S>,
 }
 
+impl<K, V, S> CacheEntryGuard<K, V, S>
+where
+    K: Hash + Ord + Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    pub(crate) fn new(key: K, value: V, cache: DashCache<K, V, S>) -> CacheEntryGuard<K, V, S> {
+        CacheEntryGuard {
+            key: Some(key),
+            value: Some(value),
+            cache,
+        }
+    }
+}
+
 impl<K, V, S> Deref for CacheEntryGuard<K, V, S>
 where
     K: Hash + Ord + Clone + Send + Sync + 'static,
