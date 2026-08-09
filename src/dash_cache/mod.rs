@@ -45,11 +45,15 @@ where
     V: Clone + Send + Sync + 'static,
     S: BuildHasher + Send + Sync,
 {
-    fn new(shard: SlabShard<K, V, S, AtomicStats>) -> Slab<K, V, S> {
+    fn new(
+        shard: SlabShard<K, V, S, AtomicStats>,
+        eviction_queue_size: usize,
+        promotion_queue_size: usize,
+    ) -> Slab<K, V, S> {
         Slab {
-            promotion: CacheQueue::default(),
-            eviction: CacheQueue::default(),
-            eviction_keys: Vec::with_capacity(queue::BUFFER_SIZE),
+            promotion: CacheQueue::new(promotion_queue_size),
+            eviction: CacheQueue::new(eviction_queue_size),
+            eviction_keys: Vec::with_capacity(queue::DEFAULT_BUFFER_SIZE),
             shard,
         }
     }
@@ -82,6 +86,9 @@ where
     S: BuildHasher + Send + Sync,
     I: Iterator<Item = u32>,
 {
+    // Promotions do not need to kept track of. If the same key is promote twice in a row, then the
+    // promotion is a no-op. Duplicate promotions in this queue also maintain correct state. A
+    // promotion does not mutate the slab, rather only mutates the list pointers.
     for entry in promotions {
         slab.promote(entry);
     }
@@ -142,22 +149,18 @@ where
     V: Clone + Send + Sync + 'static,
     S: BuildHasher + Clone + Send + Sync + 'static,
 {
-    fn with_capacity_and_hasher(cap: NonZeroUsize, hasher: S) -> LockedCache<K, V, S> {
-        let shard: SlabShard<K, V, S, AtomicStats> =
-            SlabShard::with_capacity_and_hasher(cap, hasher);
-        let handle = RwLock::new(Slab::new(shard));
-        LockedCache { handle }
-    }
-
-    fn with_capacity_and_hasher_and_default_ttl(
+    fn new(
         cap: NonZeroUsize,
         hasher: S,
-        default_ttl: Duration,
+        promotion_queue_size: usize,
+        eviction_queue_size: usize,
+        default_ttl: Option<Duration>,
     ) -> LockedCache<K, V, S> {
-        let shard: SlabShard<K, V, S, AtomicStats> =
-            SlabShard::with_capacity_and_hasher_and_default_ttl(cap, hasher, default_ttl);
-        let handle = RwLock::new(Slab::new(shard));
-
+        let shard: SlabShard<K, V, S, AtomicStats> = match default_ttl {
+            Some(ttl) => SlabShard::with_capacity_and_hasher_and_default_ttl(cap, hasher, ttl),
+            None => SlabShard::with_capacity_and_hasher(cap, hasher),
+        };
+        let handle = RwLock::new(Slab::new(shard, eviction_queue_size, promotion_queue_size));
         LockedCache { handle }
     }
 
@@ -351,6 +354,8 @@ where
     num_shards: Option<NonZeroUsize>,
     hasher: S,
     default_ttl: Option<Duration>,
+    promotion_queue_size: Option<usize>,
+    eviction_queue_size: Option<usize>,
     _type_marker: PhantomData<(K, V)>,
 }
 
@@ -368,6 +373,8 @@ where
             cap: capacity,
             num_shards: None,
             hasher: ahash::RandomState::new(),
+            promotion_queue_size: None,
+            eviction_queue_size: None,
             default_ttl: None,
             _type_marker: PhantomData,
         }
@@ -383,15 +390,45 @@ where
     /// Sets the number of shards. Per-shard capacity is computed as `ceil(total_cap / num_shards)`
     /// when [`build`](DashCacheBuilder::build) is called, so total capacity may be slightly above
     /// the value passed to [`new`](DashCacheBuilder::new) when it is not evenly divisible.
-    pub fn with_num_shards(mut self, num_shards: NonZeroUsize) -> DashCacheBuilder<K, V, S> {
+    pub fn with_num_shards(&mut self, num_shards: NonZeroUsize) -> &mut DashCacheBuilder<K, V, S> {
         self.num_shards = Some(num_shards);
         self
     }
 
     /// Sets a default TTL applied to every entry inserted via [`DashCache::insert`]. Entries
     /// inserted via [`DashCache::insert_with_ttl`] override this per-call.
-    pub fn with_default_ttl(mut self, ttl: Duration) -> DashCacheBuilder<K, V, S> {
+    pub fn with_default_ttl(&mut self, ttl: Duration) -> &mut DashCacheBuilder<K, V, S> {
         self.default_ttl = Some(ttl);
+        self
+    }
+
+    /// Sets the size of the promotion queue. Promotions in the priority list are queued for all
+    /// read/get operations to allow a read to acquired a shared read lock, and amortize the cost
+    /// of all list mutations to when a write lock is required.
+    ///
+    /// The value for the promotion queue size should be decided by evaluating how many reads might
+    /// be made to the same shard before a write. If the number of reads in a row to the same shard
+    /// exceeds this value, then some promotions may be dropped.
+    pub fn with_promotion_queue_size(
+        &mut self,
+        size: NonZeroUsize,
+    ) -> &mut DashCacheBuilder<K, V, S> {
+        self.promotion_queue_size = Some(size.get());
+        self
+    }
+
+    /// Sets the size of the eviction queue. Evictions due to entry expirations are queued for all
+    /// read/get operations to allow a read to acquired a shared read lock, and amortize the cost
+    /// of all list mutations to when a write lock is required.
+    ///
+    /// The value for the eviction queue size should be decided by evaluating how many reads might
+    /// be made to the same shard before a write. If the number of reads in a row to the same shard
+    /// exceeds this value, then some promotions may be dropped.
+    pub fn with_eviction_queue_size(
+        &mut self,
+        size: NonZeroUsize,
+    ) -> &mut DashCacheBuilder<K, V, S> {
+        self.eviction_queue_size = Some(size.get());
         self
     }
 
@@ -408,6 +445,8 @@ where
             cap,
             num_shards,
             default_ttl,
+            promotion_queue_size,
+            eviction_queue_size,
             ..
         } = self;
         DashCacheBuilder {
@@ -415,35 +454,32 @@ where
             num_shards,
             hasher,
             default_ttl,
+            promotion_queue_size,
+            eviction_queue_size,
             _type_marker: PhantomData,
         }
     }
 
-    /// Consumes the builder and returns a [`DashCache`].
+    /// Returns a [`DashCache`] from the current builder configuration.
     ///
     /// If [`with_num_shards`](DashCacheBuilder::with_num_shards) was called, the cache has exactly
     /// that many shards, each with capacity `ceil(total_cap / num_shards)`. Otherwise, the number
     /// of shards defaults to the number of logical CPU cores.
-    pub fn build(self) -> DashCache<K, V, S> {
-        let DashCacheBuilder {
-            cap,
-            num_shards,
-            hasher,
-            default_ttl,
-            ..
-        } = self;
-        let inner = match num_shards {
-            Some(n) => {
-                let shard_capacity = (cap.get() as f64 / n.get() as f64).ceil() as usize;
-                InnerCacheShards::with_num_shards_and_capacity_and_hasher(
-                    n,
-                    NonZeroUsize::new(shard_capacity).unwrap(),
-                    hasher,
-                    default_ttl,
-                )
-            }
-            None => InnerCacheShards::new_with_hasher(cap, hasher, default_ttl),
-        };
+    pub fn build(&self) -> DashCache<K, V, S> {
+        let promotion_queue_size = self
+            .promotion_queue_size
+            .unwrap_or(queue::DEFAULT_BUFFER_SIZE);
+        let eviction_queue_size = self
+            .eviction_queue_size
+            .unwrap_or(queue::DEFAULT_BUFFER_SIZE);
+        let inner = InnerCacheShards::new(
+            self.cap,
+            self.num_shards,
+            self.hasher.clone(),
+            promotion_queue_size,
+            eviction_queue_size,
+            self.default_ttl,
+        );
         DashCache {
             inner: Arc::new(inner),
         }
@@ -471,66 +507,12 @@ where
     inner: Arc<InnerCacheShards<K, V, S>>,
 }
 
-impl<K, V> DashCache<K, V, ahash::RandomState>
-where
-    K: Hash + Ord + Clone + Send + Sync + 'static,
-    V: Clone + Send + Sync + 'static,
-{
-    pub fn new(capacity: NonZeroUsize) -> DashCache<K, V, ahash::RandomState> {
-        DashCache::new_with_hasher(capacity, ahash::RandomState::new())
-    }
-
-    /// Creates a `DashCache` with an explicit shard count and per-shard capacity.
-    ///
-    /// Total capacity is `num_shards * shard_capacity`.
-    pub fn with_num_shards_and_capacity(
-        num_shards: NonZeroUsize,
-        shard_capacity: NonZeroUsize,
-    ) -> DashCache<K, V, ahash::RandomState> {
-        DashCache::with_num_shards_and_capacity_and_hasher(
-            num_shards,
-            shard_capacity,
-            ahash::RandomState::new(),
-        )
-    }
-}
-
 impl<K, V, S> DashCache<K, V, S>
 where
     K: Hash + Ord + Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
     S: BuildHasher + Clone + Send + Sync,
 {
-    /// Creates a `DashCache` with one shard per logical CPU core.
-    ///
-    /// Shard capacity is `ceil(cap / cpu_count)`, with a minimum of 1. If `cap` is not evenly
-    /// divisible the total capacity will be slightly above `cap`.
-    pub fn new_with_hasher(cap: NonZeroUsize, hasher: S) -> DashCache<K, V, S> {
-        let inner = Arc::new(InnerCacheShards::<K, V, S>::new_with_hasher(
-            cap, hasher, None,
-        ));
-
-        DashCache { inner }
-    }
-
-    /// Creates a `DashCache` with an explicit shard count and per-shard capacity.
-    ///
-    /// Total capacity is `num_shards * shard_capacity`.
-    pub fn with_num_shards_and_capacity_and_hasher(
-        num_shards: NonZeroUsize,
-        shard_capacity: NonZeroUsize,
-        hasher: S,
-    ) -> DashCache<K, V, S> {
-        let inner = Arc::new(InnerCacheShards::with_num_shards_and_capacity_and_hasher(
-            num_shards,
-            shard_capacity,
-            hasher,
-            None,
-        ));
-
-        DashCache { inner }
-    }
-
     /// Returns a clone of the value for the given key and promotes it to most recently used within
     /// its shard. Acquires a write lock on the key's shard. Returns `None` on a cache miss.
     pub async fn get<Q>(&self, key: &Q) -> Option<V>
@@ -663,65 +645,35 @@ where
     T: Clone + Send + Sync + 'static,
     S: BuildHasher + Clone + Send + Sync + 'static,
 {
-    fn new_with_hasher(
-        capacity: NonZeroUsize,
+    fn new(
+        cap: NonZeroUsize,
+        num_shards: Option<NonZeroUsize>,
         hasher: S,
+        promotion_queue_size: usize,
+        eviction_queue_size: usize,
         default_ttl: Option<Duration>,
     ) -> InnerCacheShards<K, T, S> {
-        let shard_count = default_shard_count();
-        let cap = capacity.get();
-
+        let shard_count = num_shards
+            .map(|n| n.get())
+            .unwrap_or_else(default_shard_count);
         let shard_capacity =
-            NonZeroUsize::new(((cap as f32 / shard_count as f32).ceil() as usize).max(1_usize))
+            NonZeroUsize::new(((cap.get() as f64 / shard_count as f64).ceil() as usize).max(1))
                 .unwrap();
 
         let shards_vec: Vec<LockedCache<K, T, S>> = (0..shard_count)
             .map(|_| {
-                let h = hasher.clone();
-                match default_ttl {
-                    Some(ttl) => LockedCache::with_capacity_and_hasher_and_default_ttl(
-                        shard_capacity,
-                        h,
-                        ttl,
-                    ),
-                    None => LockedCache::with_capacity_and_hasher(shard_capacity, h),
-                }
+                LockedCache::new(
+                    shard_capacity,
+                    hasher.clone(),
+                    promotion_queue_size,
+                    eviction_queue_size,
+                    default_ttl,
+                )
             })
             .collect();
 
         let cache_shards = shards_vec.into_boxed_slice();
         let num_shards = unsafe { NonZeroUsize::new_unchecked(shard_count) };
-
-        InnerCacheShards {
-            cache_shards,
-            num_shards,
-        }
-    }
-
-    fn with_num_shards_and_capacity_and_hasher(
-        num_shards: NonZeroUsize,
-        shard_capacity: NonZeroUsize,
-        hasher: S,
-        default_ttl: Option<Duration>,
-    ) -> InnerCacheShards<K, T, S> {
-        let shard_count = num_shards.get();
-        let shards_vec: Vec<LockedCache<K, T, S>> = (0..num_shards.get())
-            .map(|_| {
-                let h = hasher.clone();
-                match default_ttl {
-                    Some(ttl) => LockedCache::with_capacity_and_hasher_and_default_ttl(
-                        shard_capacity,
-                        h,
-                        ttl,
-                    ),
-                    None => LockedCache::with_capacity_and_hasher(shard_capacity, h),
-                }
-            })
-            .collect();
-
-        let cache_shards = shards_vec.into_boxed_slice();
-        let num_shards = unsafe { NonZeroUsize::new_unchecked(shard_count) };
-
         InnerCacheShards {
             cache_shards,
             num_shards,
@@ -924,7 +876,7 @@ mod builder_tests {
 
     #[tokio::test]
     async fn build_without_num_shards_uses_cpu_count() {
-        // No num_shards set → defaults to cpu_count shards via new_with_hasher.
+        // No num_shards set → defaults to cpu_count shards.
         let cache = DashCacheBuilder::<u64, u64>::new(nz(100)).build();
         assert!(cache.num_shards() >= 1);
     }
@@ -952,10 +904,9 @@ mod dash_cache_tests {
 
     // Fixed shard count and capacity for deterministic tests — avoids CPU-count variance.
     fn make_cache(shard_cap: usize) -> DashCache<u64, u64> {
-        DashCache::with_num_shards_and_capacity(
-            NonZeroUsize::new(4).unwrap(),
-            NonZeroUsize::new(shard_cap).unwrap(),
-        )
+        DashCacheBuilder::new(NonZeroUsize::new(4 * shard_cap).unwrap())
+            .with_num_shards(NonZeroUsize::new(4).unwrap())
+            .build()
     }
 
     #[tokio::test]
@@ -1079,10 +1030,9 @@ mod dash_cache_tests {
 
     #[tokio::test]
     async fn concurrent_inserts_all_keys_present() {
-        let cache = DashCache::<u64, u64>::with_num_shards_and_capacity(
-            NonZeroUsize::new(4).unwrap(),
-            NonZeroUsize::new(1000).unwrap(),
-        );
+        let cache = DashCacheBuilder::<u64, u64>::new(NonZeroUsize::new(4000).unwrap())
+            .with_num_shards(NonZeroUsize::new(4).unwrap())
+            .build();
         let n = 200u64;
         let mut handles = Vec::new();
         for t in 0..4u64 {
@@ -1105,10 +1055,9 @@ mod dash_cache_tests {
 
     #[tokio::test]
     async fn get_accepts_borrowed_key() {
-        let cache: DashCache<String, u32> = DashCache::with_num_shards_and_capacity(
-            NonZeroUsize::new(4).unwrap(),
-            NonZeroUsize::new(10).unwrap(),
-        );
+        let cache: DashCache<String, u32> = DashCacheBuilder::new(NonZeroUsize::new(40).unwrap())
+            .with_num_shards(NonZeroUsize::new(4).unwrap())
+            .build();
         cache.insert("hello".to_string(), 1).await;
         cache.insert("world".to_string(), 2).await;
         // &str is accepted where K = String via Borrow<str>
@@ -1122,10 +1071,9 @@ mod dash_cache_tests {
 
     #[tokio::test]
     async fn contains_accepts_borrowed_key() {
-        let cache: DashCache<String, u32> = DashCache::with_num_shards_and_capacity(
-            NonZeroUsize::new(4).unwrap(),
-            NonZeroUsize::new(10).unwrap(),
-        );
+        let cache: DashCache<String, u32> = DashCacheBuilder::new(NonZeroUsize::new(40).unwrap())
+            .with_num_shards(NonZeroUsize::new(4).unwrap())
+            .build();
         cache.insert("hello".to_string(), 1).await;
         assert!(cache.contains("hello").await);
         assert!(!cache.contains("missing").await);
@@ -1133,10 +1081,9 @@ mod dash_cache_tests {
 
     #[tokio::test]
     async fn evict_accepts_borrowed_key() {
-        let cache: DashCache<String, u32> = DashCache::with_num_shards_and_capacity(
-            NonZeroUsize::new(4).unwrap(),
-            NonZeroUsize::new(10).unwrap(),
-        );
+        let cache: DashCache<String, u32> = DashCacheBuilder::new(NonZeroUsize::new(40).unwrap())
+            .with_num_shards(NonZeroUsize::new(4).unwrap())
+            .build();
         cache.insert("hello".to_string(), 1).await;
         cache.insert("world".to_string(), 2).await;
         assert_eq!(cache.evict("hello").await, Some(1));
@@ -1146,10 +1093,9 @@ mod dash_cache_tests {
 
     #[tokio::test]
     async fn update_accepts_borrowed_key() {
-        let cache: DashCache<String, u32> = DashCache::with_num_shards_and_capacity(
-            NonZeroUsize::new(4).unwrap(),
-            NonZeroUsize::new(10).unwrap(),
-        );
+        let cache: DashCache<String, u32> = DashCacheBuilder::new(NonZeroUsize::new(40).unwrap())
+            .with_num_shards(NonZeroUsize::new(4).unwrap())
+            .build();
         cache.insert("hello".to_string(), 1).await;
         cache.update("hello", 99).await.unwrap();
         assert_eq!(cache.get("hello").await, Some(99));
@@ -1249,10 +1195,9 @@ mod dash_cache_tests {
         let shards = 4usize;
         let shard_cap = 4usize;
         let total_cap = shards * shard_cap;
-        let cache = DashCache::<u64, u64>::with_num_shards_and_capacity(
-            NonZeroUsize::new(shards).unwrap(),
-            NonZeroUsize::new(shard_cap).unwrap(),
-        );
+        let cache = DashCacheBuilder::<u64, u64>::new(NonZeroUsize::new(total_cap).unwrap())
+            .with_num_shards(NonZeroUsize::new(shards).unwrap())
+            .build();
         for i in 0..(total_cap * 4) as u64 {
             cache.insert(i, i).await;
         }
@@ -1334,10 +1279,9 @@ mod dash_cache_tests {
     #[tokio::test]
     async fn checkout_drop_preserves_ttl() {
         // The entry should be re-inserted with its original expiry, not a fresh TTL.
-        let cache = DashCache::with_num_shards_and_capacity(
-            NonZeroUsize::new(4).unwrap(),
-            NonZeroUsize::new(10).unwrap(),
-        );
+        let cache: DashCache<u64, u64> = DashCacheBuilder::new(NonZeroUsize::new(40).unwrap())
+            .with_num_shards(NonZeroUsize::new(4).unwrap())
+            .build();
         let ttl = Duration::from_millis(200);
         cache.insert_with_ttl(1u64, 100u64, ttl).await;
 

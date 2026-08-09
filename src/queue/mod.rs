@@ -2,13 +2,14 @@ use std::cell::UnsafeCell;
 use std::iter::Iterator;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub(crate) const BUFFER_SIZE: usize = 128_usize;
+pub(crate) const DEFAULT_BUFFER_SIZE: usize = 128_usize;
 const FULL_SENTINEL: usize = 1_usize << (usize::BITS - 1);
 
 // Concurrent queue to queue up read promotions, implemented as a ring buffer.
 #[derive(Debug)]
 pub(crate) struct CacheQueue {
-    buffer: UnsafeCell<[u32; BUFFER_SIZE]>,
+    buffer: UnsafeCell<Box<[u32]>>,
+    capacity: usize,
     head: usize, // head is not concurrently mutated.
     tail: AtomicUsize,
 }
@@ -18,14 +19,22 @@ unsafe impl Sync for CacheQueue {}
 
 impl Default for CacheQueue {
     fn default() -> CacheQueue {
-        let buffer = UnsafeCell::new([u32::MAX; BUFFER_SIZE]);
-        let head = 0_usize;
-        let tail = AtomicUsize::new(0_usize);
-        CacheQueue { buffer, head, tail }
+        CacheQueue::new(DEFAULT_BUFFER_SIZE)
     }
 }
 
 impl CacheQueue {
+    pub(crate) fn new(queue_size: usize) -> CacheQueue {
+        let buffer = UnsafeCell::new(vec![0_u32; queue_size].into_boxed_slice());
+        let head = 0_usize;
+        let tail = AtomicUsize::new(0_usize);
+        CacheQueue {
+            buffer,
+            head,
+            tail,
+            capacity: queue_size,
+        }
+    }
     // Push an entry for promotion on the queue.
     //
     // When the queue is full, the MSB of the tail will be flipped on. This will never result in a
@@ -49,7 +58,7 @@ impl CacheQueue {
         }
 
         // If we have reached max capacity, mark as full.
-        if entry >= BUFFER_SIZE {
+        if entry >= self.capacity {
             let _ = self.tail.fetch_or(FULL_SENTINEL, Ordering::Release);
             return;
         }
@@ -71,12 +80,13 @@ impl CacheQueue {
     /// This also clears the queue, and resets the head and tail to the front of the queue.
     pub(crate) fn drain(&mut self) -> QueueIter {
         let mut tail = self.tail.load(Ordering::Relaxed);
-        tail = (tail & !FULL_SENTINEL).min(BUFFER_SIZE);
+        tail = (tail & !FULL_SENTINEL).min(self.capacity);
         let queue = unsafe { &*self.buffer.get() };
         let promotion_iter = QueueIter {
             queue,
             current: 0_usize,
             end: tail,
+            capacity: self.capacity,
         };
         self.head = 0;
         self.tail.store(0_usize, Ordering::Release);
@@ -88,9 +98,10 @@ impl CacheQueue {
 // This is guaranteed to only be held while an exlusive write lock is held, thus the lifetime is
 // safe and upheld.
 pub(crate) struct QueueIter<'a> {
-    queue: &'a [u32; BUFFER_SIZE], // Ref to the Queue's buffer.
+    queue: &'a Box<[u32]>, // Ref to the Queue's buffer.
     current: usize,
     end: usize,
+    capacity: usize,
 }
 
 impl<'a> Iterator for QueueIter<'a> {
@@ -101,7 +112,7 @@ impl<'a> Iterator for QueueIter<'a> {
             return None;
         }
 
-        let item = self.queue[self.current % BUFFER_SIZE];
+        let item = self.queue[self.current % self.capacity];
         self.current += 1;
         Some(item)
     }
