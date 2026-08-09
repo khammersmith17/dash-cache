@@ -70,9 +70,7 @@ where
         let cache = self.cache.clone();
 
         let Ok(handle) = Handle::try_current() else {
-            unreachable!(
-                "Unable to get the current tokio Runtime. DashCache must be used in a tokio context."
-            )
+            return;
         };
 
         handle.spawn(async move { cache.insert_with_expires(key, value, expires).await });

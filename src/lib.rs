@@ -13,5 +13,6 @@ pub(crate) mod util;
 /// exposed to optimize concurrent and shared access, thus there is some overhead paid for cloning
 /// data on get and set type methods.
 pub use core::SlabShard;
-pub use dash_cache::DashCache;
+pub use dash_cache::{DashCache, DashCacheBuilder};
+pub use guard::CacheEntryGuard;
 pub use stats::CacheStats;

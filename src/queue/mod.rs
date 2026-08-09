@@ -1,16 +1,16 @@
 use std::cell::UnsafeCell;
 use std::iter::Iterator;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub(crate) const BUFFER_SIZE: usize = 64_usize;
+pub(crate) const BUFFER_SIZE: usize = 128_usize;
+const FULL_SENTINEL: usize = 1_usize << (usize::BITS - 1);
 
 // Concurrent queue to queue up read promotions, implemented as a ring buffer.
 #[derive(Debug)]
 pub(crate) struct CacheQueue {
     buffer: UnsafeCell<[u32; BUFFER_SIZE]>,
-    head: usize,
+    head: usize, // head is not concurrently mutated.
     tail: AtomicUsize,
-    full: AtomicBool,
 }
 
 unsafe impl Send for CacheQueue {}
@@ -21,28 +21,41 @@ impl Default for CacheQueue {
         let buffer = UnsafeCell::new([u32::MAX; BUFFER_SIZE]);
         let head = 0_usize;
         let tail = AtomicUsize::new(0_usize);
-        let full = AtomicBool::new(false);
-        CacheQueue {
-            buffer,
-            head,
-            tail,
-            full,
-        }
+        CacheQueue { buffer, head, tail }
     }
 }
 
 impl CacheQueue {
     // Push an entry for promotion on the queue.
+    //
+    // When the queue is full, the MSB of the tail will be flipped on. This will never result in a
+    // collision given the max buffer size.
+    //
+    // If the MSB is flipped on, then we skip and drop the entry. This will ignore some valid
+    // operations, but will ensure that this buffer is safe and statically sized.
     pub(crate) fn push(&self, idx: u32) {
-        if self.full.load(Ordering::Acquire) {
+        // First check is the buffer is full.
+        let state = self.tail.load(Ordering::Relaxed);
+        if state & FULL_SENTINEL != 0 {
             return;
         }
-        let count = self.tail.fetch_add(1_usize, Ordering::Relaxed);
-        let entry = count % BUFFER_SIZE;
-        if count - self.head >= BUFFER_SIZE {
-            self.full.store(true, Ordering::Release);
+
+        // Fetch the slot in the queue to write the entry to.
+        let entry = self.tail.fetch_add(1_usize, Ordering::Relaxed);
+
+        // Check again to ensure nobody else marked as full in the meantime.
+        if entry & FULL_SENTINEL != 0 {
             return;
         }
+
+        // If we have reached max capacity, mark as full.
+        if entry >= BUFFER_SIZE {
+            let _ = self.tail.fetch_or(FULL_SENTINEL, Ordering::Release);
+            return;
+        }
+
+        // SAFETY: entry offset is guaranteed to be within the bounds of the array bounds, given
+        // the above statement.
         unsafe {
             (*self.buffer.get()).as_mut_ptr().add(entry).write(idx);
         }
@@ -51,16 +64,22 @@ impl CacheQueue {
     /// We know one thread will pop off the entire list of entries. The callers of this will have
     /// an exclusive lock on the shards slab. Thus we can just iterate with a guard to ensure that
     /// reader wrote the value after incrementing the atomic.
+    ///
+    /// The exclusive reference is reasonable here, given the constraint this method is only called
+    /// in the context of a held write lock.
+    ///
+    /// This also clears the queue, and resets the head and tail to the front of the queue.
     pub(crate) fn drain(&mut self) -> QueueIter {
-        let tail = self.tail.load(Ordering::Relaxed);
+        let mut tail = self.tail.load(Ordering::Relaxed);
+        tail = (tail & !FULL_SENTINEL).min(BUFFER_SIZE);
         let queue = unsafe { &*self.buffer.get() };
         let promotion_iter = QueueIter {
             queue,
-            current: self.head,
+            current: 0_usize,
             end: tail,
         };
-        self.head = tail;
-        self.full.store(false, Ordering::Release);
+        self.head = 0;
+        self.tail.store(0_usize, Ordering::Release);
         promotion_iter
     }
 }
@@ -69,7 +88,7 @@ impl CacheQueue {
 // This is guaranteed to only be held while an exlusive write lock is held, thus the lifetime is
 // safe and upheld.
 pub(crate) struct QueueIter<'a> {
-    queue: &'a [u32; BUFFER_SIZE],
+    queue: &'a [u32; BUFFER_SIZE], // Ref to the Queue's buffer.
     current: usize,
     end: usize,
 }
