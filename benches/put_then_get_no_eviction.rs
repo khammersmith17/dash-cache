@@ -1,5 +1,5 @@
 use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use dash_cache::core::{SlabShard, SlabShardBuilder};
+use dash_cache::core::SlabShardBuilder;
 use lru::LruCache as LruBenchmarkCache;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::num::NonZeroUsize;

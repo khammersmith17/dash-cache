@@ -5,7 +5,7 @@ use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::num::NonZeroUsize;
 use tokio::runtime::Runtime;
 
-use dash_cache::dash_cache::{DashCache, DashCacheBuilder};
+use dash_cache::dash_cache::DashCacheBuilder;
 
 fn bench_dashcache_async_sequential(rt: &Runtime, c: &mut Criterion) {
     let mut group = c.benchmark_group("dashcache_async_sequential");
