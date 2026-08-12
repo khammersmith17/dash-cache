@@ -8,12 +8,15 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 use thiserror::Error;
 
+/// Covers the three cases for a get operation that is queued in [crate::dash_cache::DashCache].
 pub(crate) enum GetResult<V: Clone> {
     Hit(V, u32),
     Miss,
     Expired(u32),
 }
 
+/// The only supported error is when an operation that requires a key to be present, in the case of
+/// an update, is performed for a key not cached.
 #[derive(Debug, Error)]
 pub enum CacheError {
     #[error("Key does not exist in cache")]
@@ -21,7 +24,7 @@ pub enum CacheError {
 }
 
 #[derive(Debug)]
-pub struct CacheEntry<K: Hash + Eq, V: Clone> {
+pub(crate) struct CacheEntry<K: Hash + Eq, V: Clone> {
     key: K,
     value: V,
     list_neighbors: u64,
@@ -33,6 +36,8 @@ impl<K: Hash + Eq, V: Clone> CacheEntry<K, V> {
     fn is_live(&self) -> bool {
         !util::is_expired(self.expires)
     }
+
+    // All list pointer bit math.
 
     #[inline]
     fn clear_neighbors(&mut self) {
@@ -60,6 +65,7 @@ impl<K: Hash + Eq, V: Clone> CacheEntry<K, V> {
     }
 }
 
+/// Builder type to configure and instance of [SlabShard].
 #[derive(Debug)]
 pub struct SlabShardBuilder<K: Hash + Ord + Clone, V: Clone, S: BuildHasher> {
     capacity: NonZeroUsize,
@@ -131,11 +137,11 @@ impl<K: Hash + Ord + Clone, V: Clone, S: BuildHasher> SlabShardBuilder<K, V, S> 
 /// of heap pointers. This gives significantly better cache locality, especially on read-heavy
 /// workloads.
 ///
-/// The `St` type parameter controls the statistics backend:
-/// - `LocalStats` (default): uses `Cell<usize>`, zero atomic overhead, `!Sync`.
-/// - `AtomicStats`: uses `AtomicUsize`, `Sync` — used internally by `DashCache`.
+/// The `St` type parameter controls the statistics backend, and are not configurable.
 ///
-/// Safety invariants are documented inline and heavily asserted in debug builds. Capacity is
+///
+/// Safety invariants are documented inline and heavily asserted in debug builds, so debug builds
+/// may see reduced performance, but my review bugs. In this case please file an issue. Capacity is
 /// limited to `u32::MAX >> 1` entries, reserving `u32::MAX` as the null pointer sentinel.
 /// All values returned are clones.
 #[derive(Debug)]
@@ -238,6 +244,7 @@ where
     /// expired.
     #[inline]
     fn is_entry_valid(&self, entry_idx: u32) -> bool {
+        debug_assert!((entry_idx as usize) < self.slab.len());
         unsafe { self.slab.get_unchecked(entry_idx as usize).is_live() }
     }
 
@@ -258,6 +265,7 @@ where
         self.slab.len()
     }
 
+    /// Promote an entry to head.
     pub(crate) fn promote(&mut self, entry_idx: u32) {
         debug_assert!(self.head.is_some());
         let head_idx = self.head.unwrap();
@@ -279,8 +287,9 @@ where
             self.push_node_to_head(entry_idx);
         }
 
-        // at this point we have validated that the pointer is non null
+        // SAFETY: at this point we have validated that the pointer is non null
         // and a mutable update is safe
+        debug_assert!((entry_idx as usize) < self.slab.len());
         unsafe {
             let entry = self.slab.get_unchecked_mut(entry_idx as usize);
             entry.value = value;
@@ -324,7 +333,12 @@ where
 
         Ok(())
     }
-
+    /// Updates the value for an existing key along with the item's ttl and promotes it to
+    /// most recently used.
+    ///
+    /// Returns `Err(CacheError::KeyNotExist)` if the key is not in the cache. Use `insert` to
+    /// write a new key. There is no `get_mut` — this is the correct method for mutating a stored
+    /// value.
     pub fn update_with_ttl<Q>(&mut self, key: &Q, value: V, ttl: Duration) -> Result<(), CacheError>
     where
         K: std::borrow::Borrow<Q>,
@@ -339,6 +353,7 @@ where
     }
 
     pub(crate) fn get_key_from_entry_position(&self, entry_idx: u32) -> K {
+        debug_assert!((entry_idx as usize) < self.slab.len());
         unsafe { self.slab.get_unchecked(entry_idx as usize).key.clone() }
     }
 
@@ -365,7 +380,7 @@ where
         Some(self.evict_entry(entry_idx))
     }
 
-    pub fn evict_entry(&mut self, entry_idx: u32) -> (K, V, u64) {
+    pub(crate) fn evict_entry(&mut self, entry_idx: u32) -> (K, V, u64) {
         self.unlink_node(entry_idx);
 
         #[cfg(debug_assertions)]
@@ -383,10 +398,12 @@ where
             };
             *self.node_map.get_mut::<K>(swap_key).unwrap() = entry_idx;
             if let Some(swap_prev) = swap_prev {
+                debug_assert!((swap_prev as usize) < self.slab.len());
                 let entry = unsafe { self.slab.get_unchecked_mut(swap_prev as usize) };
                 entry.set_next(Some(entry_idx));
             }
             if let Some(swap_next) = swap_next {
+                debug_assert!((swap_next as usize) < self.slab.len());
                 let entry = unsafe { self.slab.get_unchecked_mut(swap_next as usize) };
                 entry.set_prev(Some(entry_idx));
             }
@@ -398,11 +415,17 @@ where
             }
         }
 
-        let CacheEntry { key, value, expires, .. } = self.slab.swap_remove(entry_idx as usize);
+        let CacheEntry {
+            key,
+            value,
+            expires,
+            ..
+        } = self.slab.swap_remove(entry_idx as usize);
         (key, value, expires)
     }
 
     pub(crate) fn evict_from_idx(&mut self, entry_idx: u32) {
+        debug_assert!((entry_idx as usize) < self.slab.len());
         let key = unsafe { &self.slab.get_unchecked(entry_idx as usize).key };
         let _ = self.node_map.remove(key);
         let _ = self.evict_entry(entry_idx);
@@ -420,6 +443,8 @@ where
         self.node_map.len() == self.cap
     }
 
+    /// Insert a new item into the cache with a non default TTL. If the item already exists, then
+    /// the value will be update, TTL will be update, and the entry will be promoted.
     pub fn insert_with_ttl(&mut self, key: K, value: V, ttl: Duration) {
         let _ = self.insert_entry(key, value, util::expires_from_ttl(Some(ttl)));
     }
@@ -446,6 +471,7 @@ where
                 }
                 None => {
                     let stale_idx = self.pop_tail();
+                    debug_assert!((stale_idx as usize) < self.slab.len());
                     let stale_entry = unsafe { self.slab.get_unchecked_mut(stale_idx as usize) };
                     stale_entry.key = key.clone();
                     stale_entry.value = value;
@@ -498,8 +524,8 @@ where
                 (self.head.is_some() && self.tail.is_some())
                     || (self.head.is_none() && self.tail.is_none())
             );
+            debug_assert!((entry_idx as usize) < self.slab.len());
         }
-
         let (prev_opt, next_opt) = {
             let entry: &mut CacheEntry<K, V> =
                 unsafe { self.slab.get_unchecked_mut(entry_idx as usize) };
@@ -510,6 +536,8 @@ where
 
         match (prev_opt, next_opt) {
             (Some(prev), Some(next)) => {
+                debug_assert!((prev as usize) < self.slab.len());
+                debug_assert!((next as usize) < self.slab.len());
                 // node is in the middle of the list
                 unsafe {
                     self.slab
@@ -523,11 +551,13 @@ where
                 }
             }
             (Some(prev), None) => {
+                debug_assert!((prev as usize) < self.slab.len());
                 // node is current the tail
                 unsafe { self.slab.get_unchecked_mut(prev as usize).set_next(None) }
                 self.tail = prev_opt
             }
             (None, Some(next)) => {
+                debug_assert!((next as usize) < self.slab.len());
                 // node is current head
                 unsafe { self.slab.get_unchecked_mut(next as usize).set_prev(None) }
                 self.head = next_opt
@@ -559,8 +589,8 @@ where
                     || (self.head.is_none() && self.tail.is_none())
             );
 
-            let node: &mut CacheEntry<K, V> =
-                unsafe { self.slab.get_unchecked_mut(entry_idx as usize) };
+            debug_assert!((entry_idx as usize) < self.slab.len());
+            let node: &mut CacheEntry<K, V> = &mut self.slab[entry_idx as usize];
             // if we get a cache hit on the key, then head should be Some
             let (prev, next) = (node.prev(), node.next());
             debug_assert!(prev.is_none() && next.is_none());
@@ -637,6 +667,8 @@ where
         self.get_and_promote(*entry_idx_ref)
     }
 
+    // Get an entry without promoting. Only called by [crate::dash_cache::DashCache]. In this case
+    // it is queued for next write lock acquisition.
     pub(crate) fn get_no_promote<Q>(&self, key: &Q) -> GetResult<V>
     where
         K: std::borrow::Borrow<Q>,
@@ -655,6 +687,7 @@ where
         }
         self.stats.hit();
 
+        debug_assert!((entry_idx as usize) < self.slab.len());
         let value = unsafe { self.slab.get_unchecked(entry_idx as usize).value.clone() };
         GetResult::Hit(value, entry_idx)
     }
@@ -680,7 +713,7 @@ where
         Some(value)
     }
 
-    /// Returns a snapshot of cache hit, miss, and eviction counts.
+    /// Returns a snapshot of cache hit, miss, expirations, eviction counts.
     pub fn statistics(&self) -> CacheStats {
         self.stats.snapshot()
     }

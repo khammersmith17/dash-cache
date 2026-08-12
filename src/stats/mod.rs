@@ -58,6 +58,7 @@ pub trait Stats: private::Sealed + Default + std::fmt::Debug {
 /// This is the default stats backend for `SlabShard`. It avoids atomic overhead
 /// by using `Cell` for interior mutability, which is sound because `SlabShard`
 /// requires exclusive (`&mut self`) access for all mutating operations.
+///
 #[derive(Default, Debug)]
 pub struct LocalStats {
     hits: Cell<usize>,

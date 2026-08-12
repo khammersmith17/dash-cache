@@ -1,5 +1,5 @@
 use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use dash_cache::core::SlabShard;
+use dash_cache::core::{SlabShard, SlabShardBuilder};
 use lru::LruCache as LruBenchmarkCache;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::num::NonZeroUsize;
@@ -38,7 +38,7 @@ fn bench_insert_get_sync_indexed_shard(c: &mut Criterion) {
         group.bench_function(format!("insert_then_get_cap={}", cap), |b| {
             b.iter_batched(
                 || {
-                    let cache = SlabShard::with_capacity(NonZeroUsize::new(cap).unwrap());
+                    let cache = SlabShardBuilder::new(NonZeroUsize::new(cap).unwrap()).build();
                     let mut rng = StdRng::seed_from_u64(42);
                     let keys: Vec<u64> = (0..1_000).map(|_| rng.r#gen()).collect();
                     (cache, keys)
@@ -92,7 +92,7 @@ fn bench_get_hit_only_indexed_shard(c: &mut Criterion) {
         group.bench_function(format!("n={}", n), |b| {
             b.iter_batched(
                 || {
-                    let mut cache = SlabShard::with_capacity(NonZeroUsize::new(n).unwrap());
+                    let mut cache = SlabShardBuilder::new(NonZeroUsize::new(n).unwrap()).build();
                     let mut rng = StdRng::seed_from_u64(42);
                     let keys: Vec<u64> = (0..n).map(|_| rng.r#gen()).collect();
                     for &k in &keys {
@@ -146,7 +146,7 @@ fn bench_insert_existing_non_full_indexed_shard(c: &mut Criterion) {
         group.bench_function(format!("n={}", n), |b| {
             b.iter_batched(
                 || {
-                    let mut cache = SlabShard::with_capacity(NonZeroUsize::new(n * 2).unwrap());
+                    let mut cache = SlabShardBuilder::new(NonZeroUsize::new(n * 2).unwrap()).build();
                     let mut rng = StdRng::seed_from_u64(42);
                     let keys: Vec<u64> = (0..n).map(|_| rng.r#gen()).collect();
                     for &k in &keys {

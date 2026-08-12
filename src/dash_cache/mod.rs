@@ -63,6 +63,7 @@ fn default_shard_count() -> usize {
     num_cpus::get() * 8
 }
 
+// Performs all required state updates queued on the acquisition of the write lock.
 fn perform_cleanup<K, V, S, I>(
     promotions: I,
     evictions: I,
@@ -111,6 +112,8 @@ fn evict_on_writes<K, V, S, I>(
      *
      * Thus, the keys need to first be resolved before any mutation occurs, then evict is performed
      * using the key.
+     *
+     * This does incur a clone, but keys are clone and _should_ be cheap to clone.
      * */
     keys.clear();
     for entry in evictions {
@@ -585,6 +588,8 @@ where
         self.inner.len().await
     }
 
+    /// Checkout an item from the cache. The item is temporarily removed but readded when the guard
+    /// is dropped.
     pub async fn checkout<Q>(&self, key: &Q) -> Option<CacheEntryGuard<K, V, S>>
     where
         K: std::borrow::Borrow<Q>,

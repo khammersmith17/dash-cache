@@ -1,12 +1,12 @@
 use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use dash_cache::core::SlabShard;
+use dash_cache::core::SlabShardBuilder;
 use lru::LruCache as LruBenchmarkCache;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::num::NonZeroUsize;
 
 fn bench_insert_with_eviction_crate_bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("lru_crate_comp");
-    for &cap in &[1_00usize, 1_000] {
+    for &cap in &[1_000usize, 10_000] {
         group.throughput(Throughput::Elements(10_000));
         group.bench_function(format!("insert_with_eviction={}", cap), |b| {
             b.iter_batched(
@@ -33,12 +33,12 @@ fn bench_insert_with_eviction_crate_bench(c: &mut Criterion) {
 
 fn bench_insert_with_eviction_indexed_shard(c: &mut Criterion) {
     let mut group = c.benchmark_group("indexed_shard");
-    for &cap in &[1_00usize, 1_000] {
+    for &cap in &[1_000usize, 10_000] {
         group.throughput(Throughput::Elements(10_000));
         group.bench_function(format!("insert_with_eviction={}", cap), |b| {
             b.iter_batched(
                 || {
-                    let cache = SlabShard::with_capacity(NonZeroUsize::new(cap).unwrap());
+                    let cache = SlabShardBuilder::new(NonZeroUsize::new(cap).unwrap()).build();
                     let mut rng = StdRng::seed_from_u64(42);
                     let keys: Vec<u64> = (0..10_000).map(|_| rng.r#gen()).collect();
                     (cache, keys)
@@ -60,14 +60,14 @@ fn bench_insert_with_eviction_indexed_shard(c: &mut Criterion) {
 
 fn bench_insert_only_eviction_lru_crate(c: &mut Criterion) {
     let mut group = c.benchmark_group("lru_crate_insert_only_eviction");
-    for &cap in &[100usize, 1_000] {
-        group.throughput(Throughput::Elements(10_000));
+    for &cap in &[1_000usize, 10_000] {
+        group.throughput(Throughput::Elements(100_000));
         group.bench_function(format!("cap={}", cap), |b| {
             b.iter_batched(
                 || {
                     let cache = LruBenchmarkCache::new(NonZeroUsize::new(cap).unwrap());
                     let mut rng = StdRng::seed_from_u64(42);
-                    let keys: Vec<u64> = (0..10_000).map(|_| rng.r#gen()).collect();
+                    let keys: Vec<u64> = (0..100_000).map(|_| rng.r#gen()).collect();
                     (cache, keys)
                 },
                 |(mut cache, keys)| {
@@ -84,14 +84,14 @@ fn bench_insert_only_eviction_lru_crate(c: &mut Criterion) {
 
 fn bench_insert_only_eviction_indexed_shard(c: &mut Criterion) {
     let mut group = c.benchmark_group("indexed_shard_insert_only_eviction");
-    for &cap in &[100usize, 1_000] {
-        group.throughput(Throughput::Elements(10_000));
+    for &cap in &[1_000usize, 10_000] {
+        group.throughput(Throughput::Elements(100_000));
         group.bench_function(format!("cap={}", cap), |b| {
             b.iter_batched(
                 || {
-                    let cache = SlabShard::with_capacity(NonZeroUsize::new(cap).unwrap());
+                    let cache = SlabShardBuilder::new(NonZeroUsize::new(cap).unwrap()).build();
                     let mut rng = StdRng::seed_from_u64(42);
-                    let keys: Vec<u64> = (0..10_000).map(|_| rng.r#gen()).collect();
+                    let keys: Vec<u64> = (0..100_000).map(|_| rng.r#gen()).collect();
                     (cache, keys)
                 },
                 |(mut cache, keys)| {
@@ -140,7 +140,7 @@ fn bench_insert_existing_key_full_indexed_shard(c: &mut Criterion) {
         group.bench_function(format!("n={}", n), |b| {
             b.iter_batched(
                 || {
-                    let mut cache = SlabShard::with_capacity(NonZeroUsize::new(n).unwrap());
+                    let mut cache = SlabShardBuilder::new(NonZeroUsize::new(n).unwrap()).build();
                     let mut rng = StdRng::seed_from_u64(42);
                     let keys: Vec<u64> = (0..n).map(|_| rng.r#gen()).collect();
                     for &k in &keys {

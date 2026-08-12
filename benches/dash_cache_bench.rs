@@ -5,7 +5,7 @@ use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::num::NonZeroUsize;
 use tokio::runtime::Runtime;
 
-use dash_cache::dash_cache::DashCache;
+use dash_cache::dash_cache::{DashCache, DashCacheBuilder};
 
 fn bench_dashcache_async_sequential(rt: &Runtime, c: &mut Criterion) {
     let mut group = c.benchmark_group("dashcache_async_sequential");
@@ -13,7 +13,7 @@ fn bench_dashcache_async_sequential(rt: &Runtime, c: &mut Criterion) {
     for &cap in &[10_000usize, 100_000] {
         group.throughput(Throughput::Elements(cap as u64 * 2));
         group.bench_with_input(BenchmarkId::new("insert_then_get", cap), &cap, |b, &cap| {
-            let cache = DashCache::<u64, u64>::new(NonZeroUsize::new(cap).unwrap());
+            let cache = DashCacheBuilder::<u64, u64>::new(NonZeroUsize::new(cap).unwrap()).build();
             let range = StdRng::seed_from_u64(7);
             b.to_async(rt).iter(|| {
                 let mut rng = range.clone();
@@ -49,7 +49,7 @@ fn bench_dashcache_concurrent_inserts(rt: &Runtime, c: &mut Criterion) {
             |b, &(n, tasks)| {
                 b.to_async(rt).iter(|| async move {
                     let cache =
-                        DashCache::<u64, u64>::new(NonZeroUsize::new(n.max(10_000)).unwrap());
+                        DashCacheBuilder::<u64, u64>::new(NonZeroUsize::new(n.max(10_000)).unwrap()).build();
                     let per_task = (n as usize + tasks - 1) / tasks;
                     let mut handles = Vec::with_capacity(tasks);
                     for t in 0..tasks {
@@ -81,7 +81,7 @@ fn bench_dashcache_mixed_rw(rt: &Runtime, c: &mut Criterion) {
     let ops = 200_000usize;
     group.throughput(Throughput::Elements(ops as u64));
     group.bench_function("80r_20w_random", |b| {
-        let cache = DashCache::<u64, u64>::new(NonZeroUsize::new(cap).unwrap());
+        let cache = DashCacheBuilder::<u64, u64>::new(NonZeroUsize::new(cap).unwrap()).build();
         // warm up a bit
         let warm_rt = rt;
         warm_rt.block_on(async {
@@ -120,7 +120,7 @@ fn bench_dashcache_hot_key_contention(rt: &Runtime, c: &mut Criterion) {
     group.throughput(Throughput::Elements((tasks * ops_per_task) as u64));
     group.bench_function(format!("hot_key_tasks_{tasks}_ops_{ops_per_task}"), |b| {
         b.to_async(rt).iter(|| async move {
-            let cache = DashCache::<u64, u64>::new(NonZeroUsize::new(cap).unwrap());
+            let cache = DashCacheBuilder::<u64, u64>::new(NonZeroUsize::new(cap).unwrap()).build();
             cache.insert(0, 0).await; // hot key
             let mut handles = Vec::with_capacity(tasks);
             for t in 0..tasks {
@@ -159,7 +159,7 @@ fn bench_dashcache_eviction_pressure(rt: &Runtime, c: &mut Criterion) {
     group.throughput(Throughput::Elements(ops as u64));
     group.bench_function("churn_inserts", |b| {
         b.to_async(rt).iter(|| async move {
-            let cache = DashCache::<u64, u64>::new(NonZeroUsize::new(cap).unwrap());
+            let cache = DashCacheBuilder::<u64, u64>::new(NonZeroUsize::new(cap).unwrap()).build();
             for i in 0..ops {
                 cache.insert(i as u64, i as u64).await;
                 if i % 3 == 0 {
@@ -179,7 +179,7 @@ fn bench_dashcache_contains_vs_get(rt: &Runtime, c: &mut Criterion) {
     let n = 50_000usize;
     group.throughput(Throughput::Elements(n as u64));
 
-    let cache = DashCache::<u64, u64>::new(NonZeroUsize::new(n).unwrap());
+    let cache = DashCacheBuilder::<u64, u64>::new(NonZeroUsize::new(n).unwrap()).build();
     rt.block_on(async {
         for i in 0..n {
             cache.insert(i as u64, i as u64).await;
@@ -225,7 +225,7 @@ fn bench_dashcache_update(rt: &Runtime, c: &mut Criterion) {
     let n = 50_000usize;
     group.throughput(Throughput::Elements(n as u64));
     group.bench_function("sequential_update", |b| {
-        let cache = DashCache::<u64, u64>::new(NonZeroUsize::new(n).unwrap());
+        let cache = DashCacheBuilder::<u64, u64>::new(NonZeroUsize::new(n).unwrap()).build();
         rt.block_on(async {
             for i in 0..n {
                 cache.insert(i as u64, i as u64).await;
@@ -253,7 +253,7 @@ fn bench_dashcache_concurrent_mixed_rw_isolated(rt: &Runtime, c: &mut Criterion)
     group.throughput(Throughput::Elements((tasks * ops_per_task) as u64));
     group.bench_function(format!("tasks_{tasks}_ops_{ops_per_task}"), |b| {
         b.to_async(rt).iter(|| async move {
-            let cache = DashCache::<u64, u64>::new(NonZeroUsize::new(cap).unwrap());
+            let cache = DashCacheBuilder::<u64, u64>::new(NonZeroUsize::new(cap).unwrap()).build();
             // warm to 50% so reads have something to hit
             for i in 0..(cap / 2) {
                 cache.insert(i as u64, i as u64).await;

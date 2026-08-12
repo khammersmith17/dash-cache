@@ -14,6 +14,7 @@ pub(crate) struct CacheQueue {
     tail: AtomicUsize,
 }
 
+// SAFETY: Explicit impl for Send + Sync given `UnsafeCell`.
 unsafe impl Send for CacheQueue {}
 unsafe impl Sync for CacheQueue {}
 
