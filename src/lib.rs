@@ -1,5 +1,10 @@
+#![deny(warnings)]
 pub mod core;
 pub mod dash_cache;
+pub mod guard;
+pub(crate) mod queue;
+pub mod stats;
+pub(crate) mod util;
 
 /// This crate implements both an LruCache geared toward single threaded use and also a thread safe
 /// cache intended for use across threads. The thread safe cache is optimized for concurrent
@@ -7,5 +12,7 @@ pub mod dash_cache;
 /// DashCache as an homage. All mutation is done internally, and thus not get_mut type methods are
 /// exposed to optimize concurrent and shared access, thus there is some overhead paid for cloning
 /// data on get and set type methods.
-pub use core::{CacheShard, LruCache, SlabShard};
-pub use dash_cache::DashCache;
+pub use core::SlabShard;
+pub use dash_cache::{DashCache, DashCacheBuilder};
+pub use guard::CacheEntryGuard;
+pub use stats::CacheStats;
