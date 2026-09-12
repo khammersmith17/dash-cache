@@ -1,6 +1,7 @@
-use crate::core::{CacheError, GetResult, SlabShard};
+use crate::core::{CacheError, GetResult, SlabShard, SlabShardBuilder};
 use crate::guard::CacheEntryGuard;
 use crate::queue::{self, CacheQueue};
+use crate::shared_vec::{SharedVec, SharedVecRef};
 use crate::stats::{AtomicStats, CacheStats};
 use ahash::AHasher;
 use futures::stream::{self, StreamExt};
@@ -33,7 +34,7 @@ where
     V: Clone + Send + Sync + 'static,
     S: BuildHasher + Send + Sync,
 {
-    shard: SlabShard<K, V, S, AtomicStats>,
+    shard: SlabShard<K, V, S, AtomicStats, SharedVecRef<K, V>>,
     promotion: CacheQueue,
     eviction: CacheQueue,
     eviction_keys: Vec<K>,
@@ -46,7 +47,7 @@ where
     S: BuildHasher + Send + Sync,
 {
     fn new(
-        shard: SlabShard<K, V, S, AtomicStats>,
+        shard: SlabShard<K, V, S, AtomicStats, SharedVecRef<K, V>>,
         eviction_queue_size: usize,
         promotion_queue_size: usize,
     ) -> Slab<K, V, S> {
@@ -67,7 +68,7 @@ fn default_shard_count() -> usize {
 fn perform_cleanup<K, V, S, I>(
     promotions: I,
     evictions: I,
-    slab: &mut SlabShard<K, V, S, AtomicStats>,
+    slab: &mut SlabShard<K, V, S, AtomicStats, SharedVecRef<K, V>>,
     keys: &mut Vec<K>,
 ) where
     K: Hash + Ord + Clone + Send + Sync + 'static,
@@ -80,8 +81,10 @@ fn perform_cleanup<K, V, S, I>(
     evict_on_writes(evictions, slab, keys);
 }
 
-fn promote_on_writes<K, V, S, I>(promotions: I, slab: &mut SlabShard<K, V, S, AtomicStats>)
-where
+fn promote_on_writes<K, V, S, I>(
+    promotions: I,
+    slab: &mut SlabShard<K, V, S, AtomicStats, SharedVecRef<K, V>>,
+) where
     K: Hash + Ord + Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
     S: BuildHasher + Send + Sync,
@@ -97,7 +100,7 @@ where
 
 fn evict_on_writes<K, V, S, I>(
     evictions: I,
-    slab: &mut SlabShard<K, V, S, AtomicStats>,
+    slab: &mut SlabShard<K, V, S, AtomicStats, SharedVecRef<K, V>>,
     keys: &mut Vec<K>,
 ) where
     K: Hash + Ord + Clone + Send + Sync + 'static,
@@ -153,16 +156,18 @@ where
     S: BuildHasher + Clone + Send + Sync + 'static,
 {
     fn new(
+        slab_ref: SharedVecRef<K, V>,
         cap: NonZeroUsize,
         hasher: S,
         promotion_queue_size: usize,
         eviction_queue_size: usize,
         default_ttl: Option<Duration>,
     ) -> LockedCache<K, V, S> {
-        let shard: SlabShard<K, V, S, AtomicStats> = match default_ttl {
-            Some(ttl) => SlabShard::with_capacity_and_hasher_and_default_ttl(cap, hasher, ttl),
-            None => SlabShard::with_capacity_and_hasher(cap, hasher),
-        };
+        let mut builder = SlabShardBuilder::new(cap).with_hasher(hasher);
+        if let Some(ttl) = default_ttl {
+            builder = builder.with_default_ttl(ttl);
+        }
+        let shard = builder.build_with_backend::<SharedVecRef<K, V>, AtomicStats>(slab_ref);
         let handle = RwLock::new(Slab::new(shard, eviction_queue_size, promotion_queue_size));
         LockedCache { handle }
     }
@@ -642,6 +647,7 @@ where
 {
     cache_shards: Box<[LockedCache<K, V, S>]>,
     num_shards: NonZeroUsize,
+    _shared_vec: Arc<SharedVec<K, V>>,
 }
 
 impl<K, T, S> InnerCacheShards<K, T, S>
@@ -661,14 +667,25 @@ where
         let shard_count = num_shards
             .map(|n| n.get())
             .unwrap_or_else(default_shard_count);
-        let shard_capacity =
-            NonZeroUsize::new(((cap.get() as f64 / shard_count as f64).ceil() as usize).max(1))
-                .unwrap();
 
-        let shards_vec: Vec<LockedCache<K, T, S>> = (0..shard_count)
-            .map(|_| {
+        // Round up so total capacity is evenly divisible by shard_count.
+        let shard_capacity = (cap.get() + shard_count - 1) / shard_count;
+        let total_capacity = shard_capacity * shard_count;
+
+        let shared_vec = Arc::new(SharedVec::new(
+            NonZeroUsize::new(total_capacity).unwrap(),
+            NonZeroUsize::new(shard_count).unwrap(),
+        ));
+
+        let shard_refs = shared_vec.make_shards();
+        let shard_capacity_nz = NonZeroUsize::new(shard_capacity).unwrap();
+
+        let shards_vec: Vec<LockedCache<K, T, S>> = shard_refs
+            .into_iter()
+            .map(|slab_ref| {
                 LockedCache::new(
-                    shard_capacity,
+                    slab_ref,
+                    shard_capacity_nz,
                     hasher.clone(),
                     promotion_queue_size,
                     eviction_queue_size,
@@ -682,6 +699,7 @@ where
         InnerCacheShards {
             cache_shards,
             num_shards,
+            _shared_vec: shared_vec,
         }
     }
 

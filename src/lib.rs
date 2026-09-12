@@ -1,8 +1,12 @@
 #![deny(warnings)]
+pub(crate) mod backend;
 pub mod core;
 pub mod dash_cache;
+pub(crate) mod entry;
 pub mod guard;
 pub(crate) mod queue;
+pub(crate) mod shared_vec;
+pub(crate) mod slabvec;
 pub mod stats;
 pub(crate) mod util;
 
