@@ -4,6 +4,9 @@
 //! `num_shards` non-overlapping sub-slices. Each sub-slice is handed to one [`SharedVecRef`],
 //! which is the per-shard backing store used by [`SlabShard`](crate::core::SlabShard).
 //!
+//! The full slab is allocated upfront, and is not growable after allocation. This is effectively
+//! an arena.
+//!
 //! # Memory model
 //!
 //! The allocation is owned by an `Arc<UnsafeCell<[MaybeUninit<CacheEntry<K, V>>]>>` inside
@@ -194,6 +197,12 @@ impl<K: Hash + Eq, V: Clone> SharedVecRef<K, V> {
         debug_assert!(idx < self.len);
         unsafe { (*self.ptr.add(idx).as_mut()).assume_init_mut() }
     }
+
+    fn drop_entries(&mut self) {
+        for i in 0..self.len {
+            unsafe { self.ptr.add(i).as_mut().assume_init_drop() }
+        }
+    }
 }
 
 // SAFETY: each SharedVecRef owns a non-overlapping sub-slice of the global allocation.
@@ -230,5 +239,11 @@ impl<K: Hash + Eq, V: Clone> SlabBackend<K, V> for SharedVecRef<K, V> {
             unsafe { (*self.ptr.add(i).as_mut()).assume_init_drop() }
         }
         self.len = 0;
+    }
+}
+
+impl<K: Hash + Eq, V: Clone> Drop for SharedVecRef<K, V> {
+    fn drop(&mut self) {
+        self.drop_entries()
     }
 }
