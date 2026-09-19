@@ -14,6 +14,7 @@
 - `compute_shard` now hashes via the stored `BuildHasher` instance (`self.hasher.build_hasher()`) rather than a default/static call, ensuring the configured hasher seed is always respected.
 - `eviction_keys` deduplication changed from `Vec::contains` (O(n²)) to `HashSet` (O(n)).
 - Default shard count reduced from `num_cpus * 8` to `num_cpus * 4`.
+- Remove some internal dead code.
 
 ### CI
 
