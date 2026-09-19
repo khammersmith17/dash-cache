@@ -2,7 +2,6 @@ use super::slab::{LockedCache, default_shard_count};
 use crate::core::CacheError;
 use crate::shared_vec::{SharedVec, SharedVecRef};
 use crate::stats::CacheStats;
-use futures::stream::{self, StreamExt};
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -93,13 +92,10 @@ where
     }
 
     pub(super) async fn len(&self) -> usize {
-        let len_iter = self.cache_shards.iter().map(|s| s.len());
-        let mut len_stream = stream::iter(len_iter);
         let mut len = 0_usize;
-        while let Some(l) = len_stream.next().await {
-            len += l.await
+        for shard in self.cache_shards.iter() {
+            len += shard.len().await;
         }
-
         len
     }
 

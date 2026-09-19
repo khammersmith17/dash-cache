@@ -416,11 +416,11 @@ where
     /// Insert a new item into the cache with a non default TTL. If the item already exists, then
     /// the value will be update, TTL will be update, and the entry will be promoted.
     pub fn insert_with_ttl(&mut self, key: K, value: V, ttl: Duration) {
-        let _ = self.insert_entry(key, value, util::expires_from_ttl(Some(ttl)));
+        self.insert_entry(key, value, util::expires_from_ttl(Some(ttl)));
     }
 
     pub(crate) fn insert_with_expires(&mut self, key: K, value: V, expires: u64) {
-        let _ = self.insert_entry(key, value, expires);
+        self.insert_entry(key, value, expires);
     }
 
     /// Inserts a key-value pair into the cache.
