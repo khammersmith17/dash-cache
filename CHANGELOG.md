@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.2.1]
+
+### Bug fixes
+
+- **`CacheEntryGuard` write-back no longer silent on drop outside a Tokio runtime** — if the guard is dropped on a thread with no active runtime, the write-back now falls back to `futures::executor::block_on` instead of silently discarding the entry.
+- Fix silent ignore of user defined hasher.
+
+### Internal
+
+- `DashCache` internal shards now share a single allocated arena. Each shard is given exclusive share of a slice of this slab. The full slab is held in `SharedVec` and each shard is accessed through `SharedVecRef`.
+- `dash_cache` module split into focused sub-modules: `slab` (per-shard locking layer), `inner` (shard routing), `cache` (`DashCache` public API), and `builder` (`DashCacheBuilder`).
+- `compute_shard` now hashes via the stored `BuildHasher` instance (`self.hasher.build_hasher()`) rather than a default/static call, ensuring the configured hasher seed is always respected.
+- `eviction_keys` deduplication changed from `Vec::contains` (O(n²)) to `HashSet` (O(n)).
+- Default shard count reduced from `num_cpus * 8` to `num_cpus * 4`.
+
+### CI
+
+- GitHub Actions workflow added: runs tests and sanitizers (ASan + TSan) on every push and pull request, dry-run publishes on non-master branches, and publishes to crates.io on merge to master.
+
 ## [0.2.0]
 
 ### Breaking changes

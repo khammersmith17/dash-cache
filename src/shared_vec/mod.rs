@@ -188,16 +188,19 @@ impl<K: Hash + Eq, V: Clone> SharedVecRef<K, V> {
         unsafe { self.get_unchecked_mut(idx) }
     }
 
+    /// SAFETY: Invariants in [crate::core::SlabShard] define that all accesses are valid.
     unsafe fn get_unchecked(&self, idx: usize) -> &CacheEntry<K, V> {
         debug_assert!(idx < self.len);
         unsafe { (*self.ptr.add(idx).as_ptr()).assume_init_ref() }
     }
 
+    /// SAFETY: Invariants in [crate::core::SlabShard] define that all accesses are valid.
     unsafe fn get_unchecked_mut(&mut self, idx: usize) -> &mut CacheEntry<K, V> {
         debug_assert!(idx < self.len);
         unsafe { (*self.ptr.add(idx).as_mut()).assume_init_mut() }
     }
 
+    /// Manually drop all entries in the slab slice. Required as entries are MaybeUninit.
     fn drop_entries(&mut self) {
         for i in 0..self.len {
             unsafe { self.ptr.add(i).as_mut().assume_init_drop() }
@@ -235,9 +238,7 @@ impl<K: Hash + Eq, V: Clone> SlabBackend<K, V> for SharedVecRef<K, V> {
     }
 
     fn clear(&mut self) {
-        for i in 0..self.len {
-            unsafe { (*self.ptr.add(i).as_mut()).assume_init_drop() }
-        }
+        self.drop_entries();
         self.len = 0;
     }
 }
