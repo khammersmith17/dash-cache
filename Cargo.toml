@@ -1,6 +1,6 @@
 [package]
 name = "dash_cache"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "MIT"
 description = "Contains multiple LRU cache implementations, including a sharded LRU cache implementation for concurrent performance, DashCache."
@@ -31,6 +31,10 @@ criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 rand = "0.8"
 tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "time"] }
 lru = "0.16.2"
+
+[[test]]
+name = "concurrent_stress"
+path = "integration-tests/concurrent_stress.rs"
 
 [[bench]]
 name = "put_then_get_with_eviction"

@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test
+
+  sanitizers:
+    name: Sanitizers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly toolchain with rust-src
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run sanitizer tests
+        run: bash scripts/sanitizers.sh
+
+  publish-dry-run:
+    name: Publish dry run
+    runs-on: ubuntu-latest
+    needs: [test, sanitizers]
+    if: github.ref != 'refs/heads/master'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish dry run
+        run: cargo publish --dry-run
+
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    needs: [test, sanitizers]
+    if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish
+        run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}

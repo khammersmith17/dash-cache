@@ -1,5 +1,4 @@
 use std::cell::UnsafeCell;
-use std::iter::Iterator;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub(crate) const DEFAULT_BUFFER_SIZE: usize = 128_usize;
@@ -10,7 +9,6 @@ const FULL_SENTINEL: usize = 1_usize << (usize::BITS - 1);
 pub(crate) struct CacheQueue {
     buffer: UnsafeCell<Box<[u32]>>,
     capacity: usize,
-    head: usize, // head is not concurrently mutated.
     tail: AtomicUsize,
 }
 
@@ -27,11 +25,9 @@ impl Default for CacheQueue {
 impl CacheQueue {
     pub(crate) fn new(queue_size: usize) -> CacheQueue {
         let buffer = UnsafeCell::new(vec![0_u32; queue_size].into_boxed_slice());
-        let head = 0_usize;
         let tail = AtomicUsize::new(0_usize);
         CacheQueue {
             buffer,
-            head,
             tail,
             capacity: queue_size,
         }
@@ -78,8 +74,8 @@ impl CacheQueue {
     /// The exclusive reference is reasonable here, given the constraint this method is only called
     /// in the context of a held write lock.
     ///
-    /// This also clears the queue, and resets the head and tail to the front of the queue.
-    pub(crate) fn drain(&mut self) -> QueueIter {
+    /// This also clears the queue and resets the tail to the front of the queue.
+    pub(crate) fn drain(&mut self) -> QueueIter<'_> {
         let mut tail = self.tail.load(Ordering::Relaxed);
         tail = (tail & !FULL_SENTINEL).min(self.capacity);
         let queue = unsafe { &*self.buffer.get() };
@@ -87,9 +83,7 @@ impl CacheQueue {
             queue,
             current: 0_usize,
             end: tail,
-            capacity: self.capacity,
         };
-        self.head = 0;
         self.tail.store(0_usize, Ordering::Release);
         promotion_iter
     }
@@ -99,10 +93,9 @@ impl CacheQueue {
 // This is guaranteed to only be held while an exlusive write lock is held, thus the lifetime is
 // safe and upheld.
 pub(crate) struct QueueIter<'a> {
-    queue: &'a Box<[u32]>, // Ref to the Queue's buffer.
+    queue: &'a [u32], // Ref to the Queue's buffer.
     current: usize,
     end: usize,
-    capacity: usize,
 }
 
 impl<'a> Iterator for QueueIter<'a> {
@@ -113,7 +106,7 @@ impl<'a> Iterator for QueueIter<'a> {
             return None;
         }
 
-        let item = self.queue[self.current % self.capacity];
+        let item = self.queue[self.current];
         self.current += 1;
         Some(item)
     }

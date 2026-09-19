@@ -69,11 +69,18 @@ where
         let expires = self.expires;
         let cache = self.cache.clone();
 
-        let Ok(handle) = Handle::try_current() else {
-            return;
-        };
-
-        handle.spawn(async move { cache.insert_with_expires(key, value, expires).await });
+        match Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move { cache.insert_with_expires(key, value, expires).await });
+            }
+            Err(_) => {
+                // No Tokio runtime on this thread — block synchronously so the
+                // write-back is never silently lost.
+                futures::executor::block_on(async move {
+                    cache.insert_with_expires(key, value, expires).await
+                });
+            }
+        }
     }
 }
 

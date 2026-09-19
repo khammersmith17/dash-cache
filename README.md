@@ -70,8 +70,8 @@ cap inserts followed by cap gets, no concurrency.
 
 | cap     | ns/op |
 |---------|-------|
-| 10 000  | 44.7  |
-| 100 000 | 48.7  |
+| 10 000  | 44.2  |
+| 100 000 | 50.8  |
 
 ### Concurrent inserts (N tasks, disjoint key ranges)
 
@@ -79,9 +79,9 @@ Each task inserts its own slice of keys with no key overlap.
 
 | items   | tasks | ns/op |
 |---------|-------|-------|
-| 50 000  | 4     | 60.0  |
-| 100 000 | 8     | 83.5  |
-| 200 000 | 16    | 92.2  |
+| 50 000  | 4     | 56.9  |
+| 100 000 | 8     | 67.1  |
+| 200 000 | 16    | 78.9  |
 
 ### Mixed R/W — 80% get / 20% insert, random keys (single task)
 
@@ -89,7 +89,7 @@ Each task inserts its own slice of keys with no key overlap.
 
 | ops     | ns/op |
 |---------|-------|
-| 200 000 | 79.5  |
+| 200 000 | 67.0  |
 
 ### Concurrent mixed R/W isolated (8 tasks, fresh cache per iteration)
 
@@ -98,7 +98,7 @@ Cache warmed to 50% capacity before tasks spawn.
 
 | tasks | ops/task | total ops | ns/op |
 |-------|----------|-----------|-------|
-| 8     | 25 000   | 200 000   | 109.1 |
+| 8     | 25 000   | 200 000   | 110.3 |
 
 ### Hot key contention (8 tasks)
 
@@ -107,7 +107,7 @@ remaining ops are random gets (75%) and inserts (25%).
 
 | tasks | ops/task | total ops | ns/op |
 |-------|----------|-----------|-------|
-| 8     | 25 000   | 200 000   | 80.7  |
+| 8     | 25 000   | 200 000   | 81.2  |
 
 ### Eviction pressure (single task, tiny cap)
 
@@ -116,7 +116,7 @@ Every 3rd op is also a get on a recently inserted key.
 
 | ops    | ns/op |
 |--------|-------|
-| 50 000 | 61.1  |
+| 50 000 | 60.2  |
 
 ### Contains vs Get — warm cache, no contention (single task)
 
@@ -125,8 +125,8 @@ Every 3rd op is also a get on a recently inserted key.
 
 | operation | ns/op |
 |-----------|-------|
-| contains  | 32.0  |
-| get       | 35.4  |
+| contains  | 27.4  |
+| get       | 31.4  |
 
 ### Sequential update (single task)
 
@@ -134,4 +134,4 @@ Every 3rd op is also a get on a recently inserted key.
 
 | ops    | ns/op |
 |--------|-------|
-| 50 000 | 54.0  |
+| 50 000 | 43.0  |

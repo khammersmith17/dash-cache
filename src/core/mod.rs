@@ -1,3 +1,6 @@
+use crate::backend::SlabBackend;
+use crate::entry::CacheEntry;
+use crate::slabvec::SlabVec;
 use crate::stats::{CacheStats, LocalStats, Stats};
 use crate::util;
 use std::collections::HashMap;
@@ -21,48 +24,6 @@ pub(crate) enum GetResult<V: Clone> {
 pub enum CacheError {
     #[error("Key does not exist in cache")]
     KeyNotExist,
-}
-
-#[derive(Debug)]
-pub(crate) struct CacheEntry<K: Hash + Eq, V: Clone> {
-    key: K,
-    value: V,
-    list_neighbors: u64,
-    expires: u64,
-}
-
-impl<K: Hash + Eq, V: Clone> CacheEntry<K, V> {
-    #[inline]
-    fn is_live(&self) -> bool {
-        !util::is_expired(self.expires)
-    }
-
-    // All list pointer bit math.
-
-    #[inline]
-    fn clear_neighbors(&mut self) {
-        self.list_neighbors = util::pointer_idx::null_neighbors();
-    }
-
-    #[inline]
-    fn set_next(&mut self, next: Option<u32>) {
-        self.list_neighbors = util::pointer_idx::set_next_pointer(self.list_neighbors, next);
-    }
-
-    #[inline]
-    fn set_prev(&mut self, prev: Option<u32>) {
-        self.list_neighbors = util::pointer_idx::set_prev_pointer(self.list_neighbors, prev);
-    }
-
-    #[inline]
-    fn prev(&self) -> Option<u32> {
-        util::pointer_idx::get_prev_pointer(self.list_neighbors)
-    }
-
-    #[inline]
-    fn next(&self) -> Option<u32> {
-        util::pointer_idx::get_next_pointer(self.list_neighbors)
-    }
 }
 
 /// Builder type to configure and instance of [SlabShard].
@@ -105,28 +66,32 @@ impl<K: Hash + Ord + Clone, V: Clone, S: BuildHasher> SlabShardBuilder<K, V, S> 
         self
     }
 
-    pub fn build(self) -> SlabShard<K, V, S, LocalStats> {
-        let Self {
-            capacity,
-            default_ttl,
-            hasher,
-            ..
-        } = self;
-        let cap = capacity.get();
+    pub fn build(self) -> SlabShard<K, V, S, LocalStats, SlabVec<K, V>> {
+        let cap = self.capacity.get();
+        self.build_with_backend(SlabVec::with_capacity(cap))
+    }
+
+    pub(crate) fn build_with_backend<Sl, St>(self, slab: Sl) -> SlabShard<K, V, S, St, Sl>
+    where
+        Sl: SlabBackend<K, V>,
+        St: Stats + Default,
+    {
+        let cap = self.capacity.get();
         if cap > (u32::MAX >> 1) as usize {
             panic!("capacity must be <= {}", u32::MAX >> 1);
         }
 
-        let node_map: HashMap<K, u32, S> = HashMap::with_capacity_and_hasher(cap, hasher);
+        let node_map: HashMap<K, u32, S> = HashMap::with_capacity_and_hasher(cap, self.hasher);
 
         SlabShard {
             cap,
             node_map,
-            slab: Vec::with_capacity(cap),
+            slab,
             head: None,
             tail: None,
-            stats: LocalStats::default(),
-            default_ttl,
+            stats: St::default(),
+            default_ttl: self.default_ttl,
+            _marker: PhantomData,
         }
     }
 }
@@ -145,7 +110,7 @@ impl<K: Hash + Ord + Clone, V: Clone, S: BuildHasher> SlabShardBuilder<K, V, S> 
 /// limited to `u32::MAX >> 1` entries, reserving `u32::MAX` as the null pointer sentinel.
 /// All values returned are clones.
 #[derive(Debug)]
-pub struct SlabShard<K, V, S = ahash::RandomState, St = LocalStats>
+pub struct SlabShard<K, V, S = ahash::RandomState, St = LocalStats, Sl = SlabVec<K, V>>
 where
     K: Hash + Ord + Clone,
     V: Clone,
@@ -153,12 +118,13 @@ where
     St: Stats,
 {
     cap: usize,
-    slab: Vec<CacheEntry<K, V>>,
+    slab: Sl,
     node_map: HashMap<K, u32, S>,
     head: Option<u32>,
     tail: Option<u32>,
     stats: St,
     default_ttl: Option<Duration>,
+    _marker: PhantomData<V>,
 }
 
 impl<K, V> SlabShard<K, V, ahash::RandomState, LocalStats>
@@ -184,18 +150,15 @@ where
     }
 }
 
-impl<K, V, S, St> SlabShard<K, V, S, St>
+impl<K, V, S, St> SlabShard<K, V, S, St, SlabVec<K, V>>
 where
     K: Hash + Ord + Clone,
     V: Clone,
     S: BuildHasher,
-    St: Stats,
+    St: Stats + Default,
 {
     /// Creates a new `SlabShard` with the given capacity. Panics if capacity exceeds `u32::MAX >> 1`.
-    pub fn with_capacity_and_hasher(capacity: NonZeroUsize, hasher: S) -> SlabShard<K, V, S, St>
-    where
-        St: Default,
-    {
+    pub fn with_capacity_and_hasher(capacity: NonZeroUsize, hasher: S) -> Self {
         let cap = capacity.get();
         if cap > (u32::MAX >> 1) as usize {
             panic!("capacity must be <= {}", u32::MAX >> 1);
@@ -206,11 +169,12 @@ where
         SlabShard {
             cap,
             node_map,
-            slab: Vec::with_capacity(cap),
+            slab: SlabVec::with_capacity(cap),
             head: None,
             tail: None,
             stats: St::default(),
             default_ttl: None,
+            _marker: PhantomData,
         }
     }
 
@@ -218,10 +182,7 @@ where
         capacity: NonZeroUsize,
         hasher: S,
         default_ttl: Duration,
-    ) -> SlabShard<K, V, S, St>
-    where
-        St: Default,
-    {
+    ) -> Self {
         let cap = capacity.get();
         if cap > (u32::MAX >> 1) as usize {
             panic!("capacity must be <= {}", u32::MAX >> 1);
@@ -232,20 +193,30 @@ where
         SlabShard {
             cap,
             node_map,
-            slab: Vec::with_capacity(cap),
+            slab: SlabVec::with_capacity(cap),
             head: None,
             tail: None,
             stats: St::default(),
             default_ttl: Some(default_ttl),
+            _marker: PhantomData,
         }
     }
+}
 
+#[allow(private_bounds)]
+impl<K, V, S, St, Sl> SlabShard<K, V, S, St, Sl>
+where
+    K: Hash + Ord + Clone,
+    V: Clone,
+    S: BuildHasher,
+    St: Stats,
+    Sl: SlabBackend<K, V>,
+{
     /// Performs a liveness check on a particular entry, to determine if the TTL on the entry has
     /// expired.
     #[inline]
     fn is_entry_valid(&self, entry_idx: u32) -> bool {
-        debug_assert!((entry_idx as usize) < self.slab.len());
-        unsafe { self.slab.get_unchecked(entry_idx as usize).is_live() }
+        self.slab.get_entry(entry_idx as usize).is_live()
     }
 
     /// Returns `true` if the key exists in the cache without promoting it or recording a hit.
@@ -287,14 +258,9 @@ where
             self.push_node_to_head(entry_idx);
         }
 
-        // SAFETY: at this point we have validated that the pointer is non null
-        // and a mutable update is safe
-        debug_assert!((entry_idx as usize) < self.slab.len());
-        unsafe {
-            let entry = self.slab.get_unchecked_mut(entry_idx as usize);
-            entry.value = value;
-            entry.expires = expires;
-        };
+        let entry = self.slab.get_entry_mut(entry_idx as usize);
+        entry.value = value;
+        entry.expires = expires;
     }
 
     /// Updates the value for an existing key and promotes it to most recently used.
@@ -333,6 +299,7 @@ where
 
         Ok(())
     }
+
     /// Updates the value for an existing key along with the item's ttl and promotes it to
     /// most recently used.
     ///
@@ -353,8 +320,7 @@ where
     }
 
     pub(crate) fn get_key_from_entry_position(&self, entry_idx: u32) -> K {
-        debug_assert!((entry_idx as usize) < self.slab.len());
-        unsafe { self.slab.get_unchecked(entry_idx as usize).key.clone() }
+        self.slab.get_entry(entry_idx as usize).key.clone()
     }
 
     /// Removes the entry for the given key and returns its value, or `None` if the key is not
@@ -390,22 +356,27 @@ where
                     || (self.head.is_none() && self.tail.is_none())
             )
         }
+
         let len = self.len();
         if len > 1 && entry_idx as usize != len - 1 {
-            let (swap_key, swap_prev, swap_next) = unsafe {
-                let entry = &self.slab.get_unchecked(len - 1);
-                (&entry.key, entry.prev(), entry.next())
-            };
-            *self.node_map.get_mut::<K>(swap_key).unwrap() = entry_idx;
+            let entry = self.slab.get_entry(len - 1);
+            let swap_key = entry.key.clone();
+            let swap_prev = entry.prev();
+            let swap_next = entry.next();
+
+            *self.node_map.get_mut(&swap_key).unwrap() = entry_idx;
+
             if let Some(swap_prev) = swap_prev {
                 debug_assert!((swap_prev as usize) < self.slab.len());
-                let entry = unsafe { self.slab.get_unchecked_mut(swap_prev as usize) };
-                entry.set_next(Some(entry_idx));
+                self.slab
+                    .get_entry_mut(swap_prev as usize)
+                    .set_next(Some(entry_idx));
             }
             if let Some(swap_next) = swap_next {
                 debug_assert!((swap_next as usize) < self.slab.len());
-                let entry = unsafe { self.slab.get_unchecked_mut(swap_next as usize) };
-                entry.set_prev(Some(entry_idx));
+                self.slab
+                    .get_entry_mut(swap_next as usize)
+                    .set_prev(Some(entry_idx));
             }
             if self.head == Some(len as u32 - 1) {
                 self.head = Some(entry_idx)
@@ -420,14 +391,13 @@ where
             value,
             expires,
             ..
-        } = self.slab.swap_remove(entry_idx as usize);
+        } = self.slab.swap_remove_entry(entry_idx as usize);
         (key, value, expires)
     }
 
     pub(crate) fn evict_from_idx(&mut self, entry_idx: u32) {
-        debug_assert!((entry_idx as usize) < self.slab.len());
-        let key = unsafe { &self.slab.get_unchecked(entry_idx as usize).key };
-        let _ = self.node_map.remove(key);
+        let key = self.slab.get_entry(entry_idx as usize).key.clone();
+        let _ = self.node_map.remove(&key);
         let _ = self.evict_entry(entry_idx);
     }
 
@@ -446,11 +416,11 @@ where
     /// Insert a new item into the cache with a non default TTL. If the item already exists, then
     /// the value will be update, TTL will be update, and the entry will be promoted.
     pub fn insert_with_ttl(&mut self, key: K, value: V, ttl: Duration) {
-        let _ = self.insert_entry(key, value, util::expires_from_ttl(Some(ttl)));
+        self.insert_entry(key, value, util::expires_from_ttl(Some(ttl)));
     }
 
     pub(crate) fn insert_with_expires(&mut self, key: K, value: V, expires: u64) {
-        let _ = self.insert_entry(key, value, expires);
+        self.insert_entry(key, value, expires);
     }
 
     /// Inserts a key-value pair into the cache.
@@ -472,12 +442,13 @@ where
                 None => {
                     let stale_idx = self.pop_tail();
                     debug_assert!((stale_idx as usize) < self.slab.len());
-                    let stale_entry = unsafe { self.slab.get_unchecked_mut(stale_idx as usize) };
-                    stale_entry.key = key.clone();
-                    stale_entry.value = value;
-                    // next pointer should already be null;
-                    stale_entry.clear_neighbors();
-                    stale_entry.expires = expires;
+                    {
+                        let stale_entry = self.slab.get_entry_mut(stale_idx as usize);
+                        stale_entry.key = key.clone();
+                        stale_entry.value = value;
+                        stale_entry.clear_neighbors();
+                        stale_entry.expires = expires;
+                    }
                     self.node_map.insert(key, stale_idx);
                     stale_idx
                 }
@@ -490,14 +461,9 @@ where
                     return;
                 }
                 Entry::Vacant(vac_entry) => {
-                    let new_entry = CacheEntry {
-                        key,
-                        value,
-                        list_neighbors: util::pointer_idx::null_neighbors(),
-                        expires,
-                    };
+                    let new_entry = CacheEntry::new(key, value, expires);
                     let entry_idx = self.slab.len();
-                    self.slab.push(new_entry);
+                    self.slab.push_entry(new_entry);
                     vac_entry.insert_entry(entry_idx as u32);
                     entry_idx as u32
                 }
@@ -526,11 +492,11 @@ where
             );
             debug_assert!((entry_idx as usize) < self.slab.len());
         }
+
         let (prev_opt, next_opt) = {
-            let entry: &mut CacheEntry<K, V> =
-                unsafe { self.slab.get_unchecked_mut(entry_idx as usize) };
+            let entry = self.slab.get_entry_mut(entry_idx as usize);
             let (prev_opt, next_opt) = (entry.prev(), entry.next());
-            entry.list_neighbors = util::pointer_idx::null_neighbors();
+            entry.clear_neighbors();
             (prev_opt, next_opt)
         };
 
@@ -539,32 +505,23 @@ where
                 debug_assert!((prev as usize) < self.slab.len());
                 debug_assert!((next as usize) < self.slab.len());
                 // node is in the middle of the list
-                unsafe {
-                    self.slab
-                        .get_unchecked_mut(prev as usize)
-                        .set_next(next_opt)
-                }
-                unsafe {
-                    self.slab
-                        .get_unchecked_mut(next as usize)
-                        .set_prev(prev_opt)
-                }
+                self.slab.get_entry_mut(prev as usize).set_next(next_opt);
+                self.slab.get_entry_mut(next as usize).set_prev(prev_opt);
             }
             (Some(prev), None) => {
                 debug_assert!((prev as usize) < self.slab.len());
                 // node is current the tail
-                unsafe { self.slab.get_unchecked_mut(prev as usize).set_next(None) }
-                self.tail = prev_opt
+                self.slab.get_entry_mut(prev as usize).set_next(None);
+                self.tail = prev_opt;
             }
             (None, Some(next)) => {
                 debug_assert!((next as usize) < self.slab.len());
                 // node is current head
-                unsafe { self.slab.get_unchecked_mut(next as usize).set_prev(None) }
-                self.head = next_opt
+                self.slab.get_entry_mut(next as usize).set_prev(None);
+                self.head = next_opt;
             }
             (None, None) => {
                 // node is both head and tail
-                // no unlinking required
                 self.head = None;
                 self.tail = None;
             }
@@ -578,73 +535,52 @@ where
          * Take the current head, set its prev to new head idx
          * Set new head idx to prev head, update the head idx
          * */
-        // this method assumes that a node is fully unlinked before being pushed to the head
         #[cfg(debug_assertions)]
         {
-            // assert general invariants
-            // also assert this node is transiently unlinked
-            // unlink op should always happen before pushing to head
             debug_assert!(
                 (self.head.is_some() && self.tail.is_some())
                     || (self.head.is_none() && self.tail.is_none())
             );
-
             debug_assert!((entry_idx as usize) < self.slab.len());
-            let node: &mut CacheEntry<K, V> = &mut self.slab[entry_idx as usize];
-            // if we get a cache hit on the key, then head should be Some
+            let node = self.slab.get_entry_mut(entry_idx as usize);
             let (prev, next) = (node.prev(), node.next());
             debug_assert!(prev.is_none() && next.is_none());
         }
 
-        let node: &mut CacheEntry<K, V> =
-            unsafe { self.slab.get_unchecked_mut(entry_idx as usize) };
-
-        // if the list is non-empty, update the current head prev pointer to point to node
-        // update node next to point to current head
-        // if the list is empty set the node to be the head and tail
         if let Some(head_idx) = self.head {
-            node.set_next(self.head);
-            node.set_prev(None);
-            unsafe {
-                self.slab
-                    .get_unchecked_mut(head_idx as usize)
-                    .set_prev(Some(entry_idx))
+            {
+                let node = self.slab.get_entry_mut(entry_idx as usize);
+                node.set_next(Some(head_idx));
+                node.set_prev(None);
             }
+            self.slab
+                .get_entry_mut(head_idx as usize)
+                .set_prev(Some(entry_idx));
             self.head = Some(entry_idx);
         } else {
-            // when list is currently empty, ensure that both node pointers are null
-
-            // head and tail both get set to current node when cache is empty
             self.head = Some(entry_idx);
-            self.tail = Some(entry_idx)
+            self.tail = Some(entry_idx);
         }
     }
 
     #[inline(always)]
     fn pop_tail(&mut self) -> u32 {
-        // method assumes that it is only called when the cache is at capacity, requiring an
-        // eviction
         #[cfg(debug_assertions)]
         {
             debug_assert!(
                 (self.head.is_some() && self.tail.is_some())
                     || (self.head.is_none() && self.tail.is_none())
             );
-
             debug_assert!(self.node_map.len() == self.cap);
             debug_assert!(self.tail.is_some());
         }
 
-        // safe unwrap, validate above that tail is Some
         let tail_idx = self.tail.unwrap();
         self.unlink_node(tail_idx);
         self.stats.eviction();
 
-        unsafe {
-            self.node_map
-                .remove(&self.slab.get_unchecked(tail_idx as usize).key)
-                .unwrap()
-        }
+        let key = self.slab.get_entry(tail_idx as usize).key.clone();
+        self.node_map.remove(&key).unwrap()
     }
 
     /// Returns a clone of the value for the given key and promotes it to most recently used.
@@ -661,7 +597,6 @@ where
         };
         #[cfg(debug_assertions)]
         {
-            // if key is cache hit, head and tail must be Some
             debug_assert!(self.head.is_some() && self.tail.is_some());
         }
         self.get_and_promote(*entry_idx_ref)
@@ -687,8 +622,7 @@ where
         }
         self.stats.hit();
 
-        debug_assert!((entry_idx as usize) < self.slab.len());
-        let value = unsafe { self.slab.get_unchecked(entry_idx as usize).value.clone() };
+        let value = self.slab.get_entry(entry_idx as usize).value.clone();
         GetResult::Hit(value, entry_idx)
     }
 
@@ -701,15 +635,13 @@ where
 
         self.stats.hit();
 
-        // Promote entry to head.
         let head_idx = self.head.unwrap();
         if head_idx != entry_idx {
             self.unlink_node(entry_idx);
             self.push_node_to_head(entry_idx);
         }
 
-        let value = unsafe { self.slab.get_unchecked(entry_idx as usize).value.clone() };
-
+        let value = self.slab.get_entry(entry_idx as usize).value.clone();
         Some(value)
     }
 
@@ -846,18 +778,12 @@ mod indexed_shard_cache_test {
         assert!(c.is_empty());
     }
 
-    // The following tests target the non-full insert path (Entry API occupied branch).
-    // A prior bug called push_node_to_head after update_cache_entry already handled
-    // promotion, corrupting the list. None of the tests above cover a re-insert into
-    // a non-full cache.
-
     #[test]
     fn insert_existing_non_head_key_non_full_updates_value() {
         let mut c = SlabShard::with_capacity(NonZeroUsize::new(5).unwrap());
         c.insert(1, 10);
         c.insert(2, 20);
         c.insert(3, 30);
-        // cache is non-full, re-insert a non-head key with a new value
         c.insert(1, 99);
         assert_eq!(c.get(&1), Some(99));
         assert_eq!(c.get(&2), Some(20));
@@ -871,12 +797,9 @@ mod indexed_shard_cache_test {
         c.insert(1, 10); // tail
         c.insert(2, 20);
         c.insert(3, 30); // head
-        // re-insert 1 (tail) — should become head, 2 becomes new tail
         c.insert(1, 99);
-        // fill to capacity
         c.insert(4, 40);
         c.insert(5, 50);
-        // now full; inserting 6 should evict 2, the new LRU
         c.insert(6, 60);
         assert!(c.contains(&1));
         assert!(!c.contains(&2));
@@ -889,7 +812,6 @@ mod indexed_shard_cache_test {
         let mut c = SlabShard::with_capacity(NonZeroUsize::new(5).unwrap());
         c.insert(1, 10);
         c.insert(2, 20); // head
-        // re-insert the current head — list structure must stay consistent
         c.insert(2, 99);
         assert_eq!(c.get(&2), Some(99));
         assert_eq!(c.get(&1), Some(10));
@@ -902,10 +824,10 @@ mod indexed_shard_cache_test {
         c.insert(1, 10); // tail
         c.insert(2, 20);
         c.insert(3, 30); // head
-        c.insert(3, 99); // re-insert head — 1 should remain tail
+        c.insert(3, 99);
         c.insert(4, 40);
-        c.insert(5, 50); // now full
-        c.insert(6, 60); // evicts 1
+        c.insert(5, 50);
+        c.insert(6, 60);
         assert!(!c.contains(&1));
         assert!(c.contains(&2));
         assert_eq!(c.get(&3), Some(99));
@@ -917,13 +839,11 @@ mod indexed_shard_cache_test {
         for i in 0..5 {
             c.insert(i, i * 10);
         }
-        // repeatedly re-insert the same key with updated values
         for v in 0..5 {
             c.insert(2, v);
         }
         assert_eq!(c.get(&2), Some(4));
         assert_eq!(c.len(), 5);
-        // all other keys still reachable
         assert_eq!(c.get(&0), Some(0));
         assert_eq!(c.get(&1), Some(10));
         assert_eq!(c.get(&3), Some(30));
@@ -936,7 +856,6 @@ mod indexed_shard_cache_test {
             SlabShard::with_capacity(NonZeroUsize::new(3).unwrap());
         c.insert("hello".to_string(), 1);
         c.insert("world".to_string(), 2);
-        // &str is accepted where K = String via Borrow<str>
         assert_eq!(c.get("hello"), Some(1));
         assert_eq!(c.get("world"), Some(2));
         assert_eq!(c.get("missing"), None);
@@ -1032,15 +951,14 @@ mod indexed_shard_cache_test {
 
     #[test]
     fn contains_does_not_evict_get_does() {
-        // contains checks liveness but does not evict; get does both
         let mut c = SlabShard::with_capacity(NonZeroUsize::new(2).unwrap());
         c.insert_with_ttl("a", 1, Duration::from_millis(50));
         c.insert("b", 2);
         std::thread::sleep(Duration::from_millis(100));
         assert!(!c.contains(&"a"));
-        assert_eq!(c.len(), 2); // still occupies a slot
+        assert_eq!(c.len(), 2);
         assert_eq!(c.get(&"a"), None);
-        assert_eq!(c.len(), 1); // evicted on get
+        assert_eq!(c.len(), 1);
     }
 
     #[test]
@@ -1054,12 +972,11 @@ mod indexed_shard_cache_test {
 
     #[test]
     fn expired_slot_freed_for_new_insert() {
-        // After an expired entry is evicted via get, a new insert must succeed
         let mut c = SlabShard::with_capacity(NonZeroUsize::new(2).unwrap());
         c.insert_with_ttl("a", 1, Duration::from_millis(50));
         c.insert("b", 2);
         std::thread::sleep(Duration::from_millis(100));
-        assert_eq!(c.get(&"a"), None); // evicts "a"
+        assert_eq!(c.get(&"a"), None);
         c.insert("c", 3);
         assert_eq!(c.get(&"c"), Some(3));
         assert_eq!(c.get(&"b"), Some(2));
@@ -1069,7 +986,7 @@ mod indexed_shard_cache_test {
     #[test]
     fn no_ttl_entry_never_expires() {
         let mut c = SlabShard::with_capacity(NonZeroUsize::new(3).unwrap());
-        c.insert("a", 1); // no TTL
+        c.insert("a", 1);
         c.insert_with_ttl("b", 2, Duration::from_millis(50));
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(c.get(&"a"), Some(1));
