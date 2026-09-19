@@ -17,7 +17,8 @@
 
 ### CI
 
-- GitHub Actions workflow added: runs tests and sanitizers (ASan + TSan) on every push and pull request, dry-run publishes on non-master branches, and publishes to crates.io on merge to master.
+- Add Github Action runners.
+- Add thread and memory santizer tests to ensure memory safety with new slab backend implementation.
 
 ## [0.2.0]
 
