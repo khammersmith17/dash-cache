@@ -79,7 +79,7 @@ impl CacheQueue {
     /// in the context of a held write lock.
     ///
     /// This also clears the queue, and resets the head and tail to the front of the queue.
-    pub(crate) fn drain(&mut self) -> QueueIter {
+    pub(crate) fn drain(&mut self) -> QueueIter<'_> {
         let mut tail = self.tail.load(Ordering::Relaxed);
         tail = (tail & !FULL_SENTINEL).min(self.capacity);
         let queue = unsafe { &*self.buffer.get() };
@@ -99,7 +99,7 @@ impl CacheQueue {
 // This is guaranteed to only be held while an exlusive write lock is held, thus the lifetime is
 // safe and upheld.
 pub(crate) struct QueueIter<'a> {
-    queue: &'a Box<[u32]>, // Ref to the Queue's buffer.
+    queue: &'a [u32], // Ref to the Queue's buffer.
     current: usize,
     end: usize,
     capacity: usize,

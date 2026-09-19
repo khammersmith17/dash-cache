@@ -2,6 +2,8 @@ use crate::backend::SlabBackend;
 use crate::entry::CacheEntry;
 use std::hash::Hash;
 
+/// Type wrapper around Vec<Entry<K, V>>, in order to implement [SlabBackend].
+/// This container type is used when [crate::core::SlabShard] is run in a single threaded context.
 #[derive(Debug)]
 pub struct SlabVec<K: Hash + Eq, V: Clone>(Vec<CacheEntry<K, V>>);
 
