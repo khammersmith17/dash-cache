@@ -1,5 +1,4 @@
-use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 pub(crate) const DEFAULT_BUFFER_SIZE: usize = 128_usize;
 const FULL_SENTINEL: usize = 1_usize << (usize::BITS - 1);
@@ -7,7 +6,9 @@ const FULL_SENTINEL: usize = 1_usize << (usize::BITS - 1);
 // Concurrent queue to queue up read promotions, implemented as a ring buffer.
 #[derive(Debug)]
 pub(crate) struct CacheQueue {
-    buffer: UnsafeCell<Box<[u32]>>,
+    // Miri found some UB when this was simply u32 and two gets where called at exactly the same
+    // time. This adds some overhead but prevents that.
+    buffer: Box<[AtomicU32]>,
     capacity: usize,
     tail: AtomicUsize,
 }
@@ -24,7 +25,7 @@ impl Default for CacheQueue {
 
 impl CacheQueue {
     pub(crate) fn new(queue_size: usize) -> CacheQueue {
-        let buffer = UnsafeCell::new(vec![0_u32; queue_size].into_boxed_slice());
+        let buffer = (0..queue_size).map(|_| AtomicU32::new(0_u32)).collect();
         let tail = AtomicUsize::new(0_usize);
         CacheQueue {
             buffer,
@@ -62,9 +63,7 @@ impl CacheQueue {
 
         // SAFETY: entry offset is guaranteed to be within the bounds of the array bounds, given
         // the above statement.
-        unsafe {
-            (*self.buffer.get()).as_mut_ptr().add(entry).write(idx);
-        }
+        self.buffer[entry].store(idx, Ordering::Relaxed);
     }
 
     /// We know one thread will pop off the entire list of entries. The callers of this will have
@@ -78,9 +77,9 @@ impl CacheQueue {
     pub(crate) fn drain(&mut self) -> QueueIter<'_> {
         let mut tail = self.tail.load(Ordering::Relaxed);
         tail = (tail & !FULL_SENTINEL).min(self.capacity);
-        let queue = unsafe { &*self.buffer.get() };
+
         let promotion_iter = QueueIter {
-            queue,
+            queue: self.buffer.as_ref(),
             current: 0_usize,
             end: tail,
         };
@@ -93,7 +92,7 @@ impl CacheQueue {
 // This is guaranteed to only be held while an exlusive write lock is held, thus the lifetime is
 // safe and upheld.
 pub(crate) struct QueueIter<'a> {
-    queue: &'a [u32], // Ref to the Queue's buffer.
+    queue: &'a [AtomicU32], // Ref to the Queue's buffer.
     current: usize,
     end: usize,
 }
@@ -106,7 +105,7 @@ impl<'a> Iterator for QueueIter<'a> {
             return None;
         }
 
-        let item = self.queue[self.current];
+        let item = self.queue[self.current].load(Ordering::Relaxed);
         self.current += 1;
         Some(item)
     }

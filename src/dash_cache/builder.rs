@@ -12,9 +12,10 @@ use std::time::Duration;
 /// Construct one via [`DashCacheBuilder::new`], optionally set [`with_num_shards`] and/or
 /// [`with_hasher`], then call [`build`] to obtain a [`DashCache`].
 ///
-/// If `with_num_shards` is not called, the cache defaults to one shard per logical CPU core and
-/// distributes `capacity` evenly across them (ceiling division). If `with_hasher` is not called,
-/// `ahash::RandomState` is used.
+/// `capacity` is the total for the whole cache, split evenly across the shards (ceiling
+/// division). If `with_num_shards` is not called, the cache uses four shards per logical CPU
+/// core, but fewer for small caches so that every shard holds at least 8 entries (and at least one
+/// shard). If `with_hasher` is not called, `ahash::RandomState` is used.
 ///
 /// [`with_num_shards`]: DashCacheBuilder::with_num_shards
 /// [`with_hasher`]: DashCacheBuilder::with_hasher
@@ -140,7 +141,8 @@ where
     ///
     /// If [`with_num_shards`](DashCacheBuilder::with_num_shards) was called, the cache has exactly
     /// that many shards, each with capacity `ceil(total_cap / num_shards)`. Otherwise, the number
-    /// of shards defaults to the number of logical CPU cores.
+    /// of shards defaults to four per logical CPU core, capped at `total_cap / 8` so each shard
+    /// holds at least 8 entries, and never fewer than one.
     pub fn build(&self) -> DashCache<K, V, S> {
         let promotion_queue_size = self
             .promotion_queue_size

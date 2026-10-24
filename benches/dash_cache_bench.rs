@@ -48,8 +48,10 @@ fn bench_dashcache_concurrent_inserts(rt: &Runtime, c: &mut Criterion) {
             &(n, tasks),
             |b, &(n, tasks)| {
                 b.to_async(rt).iter(|| async move {
-                    let cache =
-                        DashCacheBuilder::<u64, u64>::new(NonZeroUsize::new(n.max(10_000)).unwrap()).build();
+                    let cache = DashCacheBuilder::<u64, u64>::new(
+                        NonZeroUsize::new(n.max(10_000)).unwrap(),
+                    )
+                    .build();
                     let per_task = (n as usize + tasks - 1) / tasks;
                     let mut handles = Vec::with_capacity(tasks);
                     for t in 0..tasks {

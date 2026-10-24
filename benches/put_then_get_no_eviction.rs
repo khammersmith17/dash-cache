@@ -146,7 +146,8 @@ fn bench_insert_existing_non_full_indexed_shard(c: &mut Criterion) {
         group.bench_function(format!("n={}", n), |b| {
             b.iter_batched(
                 || {
-                    let mut cache = SlabShardBuilder::new(NonZeroUsize::new(n * 2).unwrap()).build();
+                    let mut cache =
+                        SlabShardBuilder::new(NonZeroUsize::new(n * 2).unwrap()).build();
                     let mut rng = StdRng::seed_from_u64(42);
                     let keys: Vec<u64> = (0..n).map(|_| rng.r#gen()).collect();
                     for &k in &keys {

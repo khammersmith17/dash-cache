@@ -36,6 +36,10 @@ lru = "0.16.2"
 name = "concurrent_stress"
 path = "integration-tests/concurrent_stress.rs"
 
+[[test]]
+name = "miri_probe"
+path = "integration-tests/miri_probe.rs"
+
 [[bench]]
 name = "put_then_get_with_eviction"
 harness = false

@@ -54,9 +54,19 @@ where
     }
 }
 
-// 4 shards per cpu by default.
-pub(super) fn default_shard_count() -> usize {
-    num_cpus::get() * 4
+/// Fewest entries a shard holds when the shard count is chosen by default. Per-shard LRU needs some
+/// room to work: with only one or two entries per shard, eviction is decided by which keys hash to
+/// the same shard rather than by recency.
+pub(super) const MIN_DEFAULT_SHARD_CAPACITY: usize = 8;
+
+// 4 shards per CPU by default, capped so each shard still holds at least
+// `MIN_DEFAULT_SHARD_CAPACITY` entries. A small cache gets fewer shards, down to one. Without the
+// cap, a cache with fewer entries than shards would round every shard up to one entry and hold far
+// more than the requested capacity.
+pub(super) fn default_shard_count(capacity: usize) -> usize {
+    (num_cpus::get() * 4)
+        .min(capacity / MIN_DEFAULT_SHARD_CAPACITY)
+        .max(1)
 }
 
 // Performs all required state updates queued on the acquisition of the write lock.

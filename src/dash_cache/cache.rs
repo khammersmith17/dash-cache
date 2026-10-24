@@ -104,8 +104,45 @@ where
         self.inner.len().await
     }
 
-    /// Checkout an item from the cache. The item is temporarily removed but readded when the guard
-    /// is dropped.
+    /// Removes the entry from the cache and returns a [`CacheEntryGuard`] that dereferences to its
+    /// value. When the guard is dropped, the value is written back with its
+    /// original expiry. Returns `None` if the key is not present.
+    ///
+    /// The write-back is asynchronous: inside a Tokio runtime it is spawned as a task, so it
+    /// completes some time after the guard is dropped. Until it does:
+    ///
+    /// - the key is absent: [`get`](DashCache::get) and [`contains`](DashCache::contains) miss,
+    ///   and other callers may [`insert`](DashCache::insert) it;
+    /// - if another caller inserts the key, the write-back later **overwrites** that newer value;
+    /// - if the runtime shuts down before the task runs, the write-back is **lost**.
+    ///
+    /// Outside a Tokio runtime, dropping the guard blocks the current thread until the write-back
+    /// completes. Drop it immediately after it is mutated.
+    ///
+    /// Use `checkout` for values that are not written concurrently, where losing a write-back at
+    /// shutdown is acceptable.
+    ///
+    /// # Example
+    ///
+    /// Keep the guard's scope as short as possible: mutate the value, then let the guard drop
+    /// straight away. The key is missing from the cache for as long as the guard is alive, so
+    /// don't hold it across unrelated `.await`s.
+    ///
+    /// ```
+    /// use dash_cache::DashCacheBuilder;
+    /// use std::num::NonZeroUsize;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let cache = DashCacheBuilder::<u64, Vec<u64>>::new(NonZeroUsize::new(16).unwrap()).build();
+    /// cache.insert(1, vec![10]).await;
+    ///
+    /// if let Some(mut values) = cache.checkout(&1).await {
+    ///     values.push(20);
+    /// } // `values` is dropped here, which starts the write-back.
+    ///
+    /// # }
+    /// ```
     pub async fn checkout<Q>(&self, key: &Q) -> Option<CacheEntryGuard<K, V, S>>
     where
         K: std::borrow::Borrow<Q>,
