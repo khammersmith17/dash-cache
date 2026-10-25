@@ -37,7 +37,7 @@ where
     ) -> InnerCacheShards<K, T, S> {
         let shard_count = num_shards
             .map(|n| n.get())
-            .unwrap_or_else(default_shard_count);
+            .unwrap_or_else(|| default_shard_count(cap.get()));
 
         // Round up so total capacity is evenly divisible by shard_count.
         let shard_capacity = (cap.get() + shard_count - 1) / shard_count;

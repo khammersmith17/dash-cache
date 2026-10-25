@@ -3,6 +3,12 @@ use std::hash::{BuildHasher, Hash};
 use std::ops::{Deref, DerefMut};
 use tokio::runtime::Handle;
 
+/// A value checked out of a [`DashCache`] by [`DashCache::checkout`].
+///
+/// Dereferences to the value, mutably as well, so it can be modified in place. The entry is
+/// absent from the cache while the guard is held. Dropping the guard writes the value back
+/// asynchronously, which can overwrite a newer insert of the same key or be lost if the runtime
+/// shuts down first; see [`DashCache::checkout`] for the details.
 pub struct CacheEntryGuard<K, V, S>
 where
     K: Hash + Ord + Clone + Send + Sync + 'static,
@@ -21,7 +27,12 @@ where
     V: Clone + Send + Sync + 'static,
     S: BuildHasher + Clone + Send + Sync + 'static,
 {
-    pub(crate) fn new(key: K, value: V, expires: u64, cache: DashCache<K, V, S>) -> CacheEntryGuard<K, V, S> {
+    pub(crate) fn new(
+        key: K,
+        value: V,
+        expires: u64,
+        cache: DashCache<K, V, S>,
+    ) -> CacheEntryGuard<K, V, S> {
         CacheEntryGuard {
             key: Some(key),
             value: Some(value),
@@ -83,4 +94,3 @@ where
         }
     }
 }
-

@@ -59,7 +59,10 @@ fn now_nanos() -> u64 {
 
 pub(crate) fn expires_from_ttl(ttl: Option<Duration>) -> u64 {
     let Some(ttl) = ttl else { return 0_u64 };
-    ttl.as_nanos() as u64 + now_nanos()
+    // TTL of Duration::MAX may cause overflow.
+    u64::try_from(ttl.as_nanos())
+        .unwrap_or(u64::MAX)
+        .saturating_add(now_nanos())
 }
 
 pub(crate) fn is_expired(t: u64) -> bool {

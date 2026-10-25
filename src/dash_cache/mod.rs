@@ -80,13 +80,6 @@ mod builder_tests {
     }
 
     #[tokio::test]
-    async fn build_without_num_shards_uses_cpu_count() {
-        // No num_shards set → defaults to cpu_count shards.
-        let cache = DashCacheBuilder::<u64, u64>::new(nz(100)).build();
-        assert!(cache.num_shards() >= 1);
-    }
-
-    #[tokio::test]
     async fn builder_cap_equals_one_per_shard() {
         // Edge case: total cap == num_shards → shard_cap = 1 each.
         let n = 4usize;
@@ -100,6 +93,48 @@ mod builder_tests {
             cache.insert(i, i).await;
         }
         assert!(cache.len().await <= n);
+    }
+
+    // Regression test: the default shard count used to be four per CPU whatever the capacity, so a
+    // cache smaller than the shard count rounded every shard up to one entry and held far more
+    // than requested. The default now keeps at least 8 entries per shard.
+    #[tokio::test]
+    async fn default_shards_do_not_inflate_small_capacity() {
+        let cache = DashCacheBuilder::<u64, u64>::new(nz(10)).build();
+        assert_eq!(cache.num_shards(), 1, "10 entries only allow one shard of 8 or more");
+        for i in 0..1_000u64 {
+            cache.insert(i, i).await;
+        }
+        assert_eq!(cache.len().await, 10, "holds exactly the requested capacity");
+    }
+
+    #[tokio::test]
+    async fn default_shards_keep_minimum_entries_per_shard() {
+        for cap in [1usize, 7, 8, 9, 16, 100, 1_000] {
+            let cache = DashCacheBuilder::<u64, u64>::new(nz(cap)).build();
+            let shards = cache.num_shards();
+            assert!(shards >= 1, "capacity {cap}: at least one shard");
+            assert!(
+                shards == 1 || cap / shards >= slab::MIN_DEFAULT_SHARD_CAPACITY,
+                "capacity {cap}: {shards} shards leave fewer than the minimum per shard"
+            );
+            assert!(shards <= num_cpus::get() * 4, "capacity {cap}: more than 4 shards per CPU");
+        }
+    }
+
+    #[tokio::test]
+    async fn default_shards_for_large_capacity_are_four_per_cpu() {
+        let cache = DashCacheBuilder::<u64, u64>::new(nz(1_000_000)).build();
+        assert_eq!(cache.num_shards(), num_cpus::get() * 4);
+    }
+
+    #[tokio::test]
+    async fn explicit_num_shards_is_not_capped() {
+        // `with_num_shards` is used as given, even when it leaves shards below the default minimum.
+        let cache = DashCacheBuilder::<u64, u64>::new(nz(10))
+            .with_num_shards(nz(5))
+            .build();
+        assert_eq!(cache.num_shards(), 5);
     }
 }
 

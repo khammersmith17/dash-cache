@@ -22,11 +22,11 @@ run() {
 
 run "AddressSanitizer" \
     env RUSTFLAGS="-Z sanitizer=address" \
-    cargo +nightly test -Z build-std --target "$TARGET"
+    cargo +nightly test -Z build-std --target "$TARGET" --lib --tests
 
 run "ThreadSanitizer" \
     env RUSTFLAGS="-Z sanitizer=thread -C unsafe-allow-abi-mismatch=sanitizer" \
-    cargo +nightly test --lib --tests -Z build-std --target "$TARGET"
+    cargo +nightly test  -Z build-std --target "$TARGET" --lib --tests
 
 
 

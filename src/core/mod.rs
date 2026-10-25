@@ -995,4 +995,36 @@ mod indexed_shard_cache_test {
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.expirations, 1);
     }
+
+    // Regression test: a TTL too large for `u64` nanoseconds means "never expires". Converting it
+    // used to panic on overflow in debug builds, and to truncate it with `as u64` in release
+    // builds, so a huge TTL could become a tiny one and the entry expired immediately.
+    #[test]
+    fn huge_ttl_never_expires() {
+        let huge_ttls = [
+            // The largest TTL.
+            Duration::MAX,
+            // A multiple of 2^64 nanoseconds: `as u64` truncated it to exactly 0.
+            Duration::from_secs(1 << 55),
+            // Just over u64::MAX nanoseconds.
+            Duration::from_nanos(u64::MAX) + Duration::from_nanos(1),
+        ];
+
+        for ttl in huge_ttls {
+            let mut c = SlabShard::with_capacity(NonZeroUsize::new(4).unwrap());
+            c.insert_with_ttl("insert", 1, ttl);
+            c.insert("update", 2);
+            c.update_with_ttl(&"update", 3, ttl).unwrap();
+            assert_eq!(c.get(&"insert"), Some(1), "insert_with_ttl({ttl:?})");
+            assert_eq!(c.get(&"update"), Some(3), "update_with_ttl({ttl:?})");
+
+            let mut d =
+                SlabShard::with_capacity_and_default_ttl(NonZeroUsize::new(4).unwrap(), ttl);
+            d.insert("default", 4);
+            assert_eq!(d.get(&"default"), Some(4), "default ttl {ttl:?}");
+
+            assert_eq!(c.statistics().expirations, 0);
+            assert_eq!(d.statistics().expirations, 0);
+        }
+    }
 }
