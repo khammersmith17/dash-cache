@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.2.3]
+
+### Bug fixes
+
+- When a `DashCache` shard's promotion or eviction queue fills up, the `get` that finds it full now takes the shard's write lock and drains both queues early, then applies its own promotion or eviction by key. Previously, promotions and evictions pushed to a full queue were silently dropped.
+- `update` and `update_with_ttl` now return `Err(CacheError::KeyNotExist)` for an expired entry instead of updating it in place.
+- `SharedVecRef::push_item` now checks `len < cap` in release builds too (`assert!` instead of `debug_assert!`), so an out-of-bounds write panics instead of corrupting memory.
+
+### Internal
+
+- `DashCache` shard routing uses a multiply-shift range reduction on 32 bits from the middle of the key's hash instead of `hash % num_shards`.
+- Remove the manual `unsafe impl Send + Sync` for `CacheQueue`; it is now made only of atomics, so both are derived automatically.
+
+## [0.2.2]
+
+### Bug fixes
+
+- A TTL too large to fit in `u64` nanoseconds (for example `Duration::MAX`) now means "never expires". Previously it panicked on overflow in debug builds and was truncated in release builds, which could make the entry expire immediately.
+- The default shard count is capped so each shard holds at least 8 entries (and there is at least one shard). Previously a cache smaller than the default shard count rounded every shard up to one entry and held more than the requested capacity. An explicit `with_num_shards` is still used as given.
+- `CacheQueue` stores its buffer as `AtomicU32` instead of `u32` behind an `UnsafeCell`, fixing a data race Miri found when two `get`s pushed promotions at the same time.
+
+### Documentation
+
+- `DashCache::checkout` and `CacheEntryGuard` now document the asynchronous write-back and its caveats.
+
+### CI
+
+- Add a Miri job running the unit tests and a targeted `miri_probe` integration test across several seeds.
+
 ## [0.2.1]
 
 ### Bug fixes

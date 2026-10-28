@@ -70,7 +70,7 @@ pub(super) fn default_shard_count(capacity: usize) -> usize {
 }
 
 // Performs all required state updates queued on the acquisition of the write lock.
-fn perform_cleanup<K, V, S, I>(
+fn perform_queued_actions<K, V, S, I>(
     promotions: I,
     evictions: I,
     slab: &mut SlabShard<K, V, S, AtomicStats, SharedVecRef<K, V>>,
@@ -99,7 +99,7 @@ fn promote_on_writes<K, V, S, I>(
     // promotion is a no-op. Duplicate promotions in this queue also maintain correct state. A
     // promotion does not mutate the slab, rather only mutates the list pointers.
     for entry in promotions {
-        slab.promote(entry);
+        slab.promote_existing_entry(entry);
     }
 }
 
@@ -183,7 +183,7 @@ where
             ref mut eviction,
             ref mut eviction_keys,
         } = *guard;
-        perform_cleanup(promotion.drain(), eviction.drain(), shard, eviction_keys);
+        perform_queued_actions(promotion.drain(), eviction.drain(), shard, eviction_keys);
         shard.insert_with_ttl(key, value, ttl);
     }
 
@@ -202,7 +202,7 @@ where
 
         // This is not a write operation, but does take a write lock.
         // Given the held write lock, any reads are promoted.
-        perform_cleanup(promotion.drain(), eviction.drain(), shard, eviction_keys);
+        perform_queued_actions(promotion.drain(), eviction.drain(), shard, eviction_keys);
         shard.evict_full_entry(key)
     }
 
@@ -214,7 +214,7 @@ where
             ref mut eviction,
             ref mut eviction_keys,
         } = *guard;
-        perform_cleanup(promotion.drain(), eviction.drain(), shard, eviction_keys);
+        perform_queued_actions(promotion.drain(), eviction.drain(), shard, eviction_keys);
         shard.insert_with_expires(key, value, expires);
     }
 
@@ -235,7 +235,7 @@ where
             ref mut eviction,
             ref mut eviction_keys,
         } = *guard;
-        perform_cleanup(promotion.drain(), eviction.drain(), shard, eviction_keys);
+        perform_queued_actions(promotion.drain(), eviction.drain(), shard, eviction_keys);
         shard.update_with_ttl(key, value, ttl)?;
 
         Ok(())
@@ -255,7 +255,7 @@ where
             ref mut eviction,
             ref mut eviction_keys,
         } = *guard;
-        perform_cleanup(promotion.drain(), eviction.drain(), shard, eviction_keys);
+        perform_queued_actions(promotion.drain(), eviction.drain(), shard, eviction_keys);
         shard.insert(key, value)
     }
 
@@ -267,8 +267,21 @@ where
             ref mut eviction,
             ref mut eviction_keys,
         } = *guard;
-        perform_cleanup(promotion.drain(), eviction.drain(), shard, eviction_keys);
+        perform_queued_actions(promotion.drain(), eviction.drain(), shard, eviction_keys);
         shard.drain();
+    }
+
+    /// Drains the promotion and eviction queues when one of them fills up before the next write
+    /// operation, so queued promotions and evictions are applied instead of dropped.
+    #[inline]
+    fn perform_early_queue_drain(&self, slab: &mut Slab<K, V, S>) {
+        let Slab {
+            promotion,
+            shard,
+            eviction,
+            eviction_keys,
+        } = slab;
+        perform_queued_actions(promotion.drain(), eviction.drain(), shard, eviction_keys);
     }
 
     pub(super) async fn statistics(&self) -> CacheStats {
@@ -289,14 +302,29 @@ where
             ref eviction,
             ..
         } = *guard;
+
+        // Attempt to get without promoting/evicting.
+        // If either queue is full, drop the read lock, acquire the write lock and performed the
+        // queued operations.
         match shard.get_no_promote(key) {
             GetResult::Miss => None,
             GetResult::Hit(v, entry_idx) => {
-                promotion.push(entry_idx);
+                if promotion.try_push(entry_idx).is_err() {
+                    drop(guard);
+                    let mut guard = self.handle.write().await;
+                    self.perform_early_queue_drain(&mut guard);
+                    // Promote the entry while holding the write lock.
+                    guard.shard.promote_key(key);
+                }
                 Some(v)
             }
             GetResult::Expired(entry_idx) => {
-                eviction.push(entry_idx);
+                if eviction.try_push(entry_idx).is_err() {
+                    drop(guard);
+                    let mut guard = self.handle.write().await;
+                    self.perform_early_queue_drain(&mut guard);
+                    guard.shard.evict_if_expired(key);
+                }
                 None
             }
         }
@@ -314,7 +342,7 @@ where
             ref mut eviction,
             ref mut eviction_keys,
         } = *guard;
-        perform_cleanup(promotion.drain(), eviction.drain(), shard, eviction_keys);
+        perform_queued_actions(promotion.drain(), eviction.drain(), shard, eviction_keys);
         shard.evict(key)
     }
 
@@ -330,7 +358,7 @@ where
             ref mut eviction,
             ref mut eviction_keys,
         } = *guard;
-        perform_cleanup(promotion.drain(), eviction.drain(), shard, eviction_keys);
+        perform_queued_actions(promotion.drain(), eviction.drain(), shard, eviction_keys);
 
         shard.update(key, value)?;
         Ok(())

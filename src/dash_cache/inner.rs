@@ -16,7 +16,7 @@ where
     S: BuildHasher + Send + Sync,
 {
     pub(super) cache_shards: Box<[LockedCache<K, V, S>]>,
-    pub(super) num_shards: NonZeroUsize,
+    pub(super) num_shards: u64,
     hasher: S,
     _shared_vec: Arc<SharedVec<K, V>>,
 }
@@ -69,7 +69,7 @@ where
         let num_shards = unsafe { NonZeroUsize::new_unchecked(shard_count) };
         InnerCacheShards {
             cache_shards,
-            num_shards,
+            num_shards: num_shards.get() as u64,
             hasher,
             _shared_vec: shared_vec,
         }
@@ -149,8 +149,11 @@ where
     {
         let mut hasher = self.hasher.build_hasher();
         key.hash(&mut hasher);
-        let hash_value = hasher.finish();
-        hash_value as usize % usize::from(self.num_shards)
+        let hash = hasher.finish();
+        // Take 32 bits from the middle of the hash (bits 25..=56), then map them onto
+        // `0..num_shards` with a multiply-shift instead of a modulo.
+        let h = (hash << 7) >> 32;
+        ((h * self.num_shards) >> 32) as usize
     }
 
     pub(super) async fn contains<Q>(&self, key: &Q) -> bool

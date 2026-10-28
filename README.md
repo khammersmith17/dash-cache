@@ -3,13 +3,13 @@
 
 
 # dash-cache
-This package is an efficient LRU cache implementation. This implementation is different than a typical LRU cache implementation in that all entries are stored in a contiguous buffer, and the list is tracked using offsets into this buffer, rather than pointers. The introduces some CPU cache performance benefit, as observed in the benchmark numbers below. Additionally, in the concurrent data structure, all promotions and time based evictions are queued until the next write, keeping reads cheap and amortizing bookkeeping by performing them only on writes.
+This package is an efficient LRU cache implementation. This implementation is different than a typical LRU cache implementation in that all entries are stored in a contiguous buffer, and the list is tracked using offsets into this buffer, rather than pointers. This introduces some CPU cache performance benefit, as observed in the benchmark numbers below. Additionally, in the concurrent data structure, all promotions and time based evictions are queued until the next write (or until a queue fills up), keeping reads cheap and amortizing bookkeeping by performing them only on writes.
 
-The thread safe implementation is dubbed DashCache, as an homage to DashMap. As such, the internal structure is a sharded LRU Cache for performant concurrent access. Shard count can be defined by the user, or defaults to the number of cpu cores available on the machine. Given the sharded nature, each key value pair priority is local to the cache shard and not a total least recently used ordering. This is of course not a characteristic of the single threaded version.
+The thread safe implementation is dubbed DashCache, as an homage to DashMap. As such, the internal structure is a sharded LRU Cache for performant concurrent access. Shard count can be defined by the user, or defaults to four shards per CPU core, reduced for small caches so that each shard holds at least 8 entries. Given the sharded nature, each key value pair priority is local to the cache shard and not a total least recently used ordering. This is of course not a characteristic of the single threaded version.
 
-Time to live is opt in, and can be assigned per unique entry. There is no garbage collection TTL loop. TTL is lazily evaluated on a `get`, and evicted when the entry is expired. This implies that the internal state is eventually consistent which is true, but all observed state is stronly consistent.
+Time to live is opt in, and can be assigned per unique entry. There is no garbage collection TTL loop. TTL is lazily evaluated on a `get`, and evicted when the entry is expired. This implies that the internal state is eventually consistent, but all observed state is strongly consistent.
 
-The concurrent implementation only performs promotions and time based evictions on a write operateion(`insert_*` or `update_*`). In this way `get` does not incur as much lock contention.
+The concurrent implementation only performs promotions and time based evictions on a write operation (`insert*`, `update*`, `evict`, ...). In this way `get` only needs a read lock and does not incur as much lock contention.
 
 This implementation is designed to be _fast_, and leans toward making cache hits fast, as this is the desired hot path when using a cache. The performance benefit for a single threaded implementation levels out at large cache sizes with higher eviction rates. Otherwise, this implementation performs very well.
 
@@ -121,7 +121,7 @@ Every 3rd op is also a get on a recently inserted key.
 ### Contains vs Get — warm cache, no contention (single task)
 
 50 000 ops on a fully warm cache. `contains` takes a read lock with no promotion;
-`get` takes a write lock and promotes.
+`get` also takes a read lock, but queues a promotion.
 
 | operation | ns/op |
 |-----------|-------|

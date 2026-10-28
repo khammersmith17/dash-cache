@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-pub(crate) const DEFAULT_BUFFER_SIZE: usize = 128_usize;
+pub(crate) const DEFAULT_BUFFER_SIZE: usize = 256_usize;
 const FULL_SENTINEL: usize = 1_usize << (usize::BITS - 1);
 
 // Concurrent queue to queue up read promotions, implemented as a ring buffer.
@@ -12,10 +12,6 @@ pub(crate) struct CacheQueue {
     capacity: usize,
     tail: AtomicUsize,
 }
-
-// SAFETY: Explicit impl for Send + Sync given `UnsafeCell`.
-unsafe impl Send for CacheQueue {}
-unsafe impl Sync for CacheQueue {}
 
 impl Default for CacheQueue {
     fn default() -> CacheQueue {
@@ -38,13 +34,13 @@ impl CacheQueue {
     // When the queue is full, the MSB of the tail will be flipped on. This will never result in a
     // collision given the max buffer size.
     //
-    // If the MSB is flipped on, then we skip and drop the entry. This will ignore some valid
-    // operations, but will ensure that this buffer is safe and statically sized.
-    pub(crate) fn push(&self, idx: u32) {
+    // If the MSB is flipped on, the entry is not written and `Err(())` is returned, so the caller
+    // can drain the queue under a write lock. This keeps the buffer safe and statically sized.
+    pub(crate) fn try_push(&self, idx: u32) -> Result<(), ()> {
         // First check is the buffer is full.
         let state = self.tail.load(Ordering::Relaxed);
         if state & FULL_SENTINEL != 0 {
-            return;
+            return Err(());
         }
 
         // Fetch the slot in the queue to write the entry to.
@@ -52,18 +48,19 @@ impl CacheQueue {
 
         // Check again to ensure nobody else marked as full in the meantime.
         if entry & FULL_SENTINEL != 0 {
-            return;
+            return Err(());
         }
 
         // If we have reached max capacity, mark as full.
         if entry >= self.capacity {
             let _ = self.tail.fetch_or(FULL_SENTINEL, Ordering::Release);
-            return;
+            return Err(());
         }
 
         // SAFETY: entry offset is guaranteed to be within the bounds of the array bounds, given
         // the above statement.
         self.buffer[entry].store(idx, Ordering::Relaxed);
+        Ok(())
     }
 
     /// We know one thread will pop off the entire list of entries. The callers of this will have

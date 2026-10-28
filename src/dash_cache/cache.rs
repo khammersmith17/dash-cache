@@ -32,8 +32,12 @@ where
     V: Clone + Send + Sync + 'static,
     S: BuildHasher + Clone + Send + Sync,
 {
-    /// Returns a clone of the value for the given key and promotes it to most recently used within
-    /// its shard. Acquires a write lock on the key's shard. Returns `None` on a cache miss.
+    /// Returns a clone of the value for the given key. Returns `None` on a cache miss or if the
+    /// entry has expired.
+    ///
+    /// Acquires a read lock on the key's shard. The promotion to most recently used within the shard
+    /// is queued and applied on the shard's next write operation; an expired entry is likewise
+    /// queued for eviction.
     pub async fn get<Q>(&self, key: &Q) -> Option<V>
     where
         K: std::borrow::Borrow<Q>,
@@ -57,7 +61,8 @@ where
     }
 
     /// Updates the value for an existing key with an explicit TTL and promotes it to most recently
-    /// used within its shard. Returns `Err(CacheError::KeyNotExist)` if the key is not present.
+    /// used within its shard. Returns `Err(CacheError::KeyNotExist)` if the key is not present or
+    /// has expired.
     pub async fn update_with_ttl<Q>(
         &self,
         key: &Q,
@@ -72,9 +77,10 @@ where
         Ok(())
     }
 
-    /// Returns `true` if the key exists in the cache without promoting it or recording a hit.
+    /// Returns `true` if the key exists in the cache and has not expired, without promoting it or
+    /// recording a hit.
     ///
-    /// This is the only read-only method — it acquires a read lock and does not modify the shard.
+    /// Acquires a read lock on the key's shard and queues nothing, unlike [`get`](DashCache::get).
     pub async fn contains<Q>(&self, key: &Q) -> bool
     where
         K: std::borrow::Borrow<Q>,
@@ -163,8 +169,8 @@ where
 
     /// Updates the value for an existing key and promotes it to most recently used within its shard.
     ///
-    /// Returns `Err(CacheError::KeyNotExist)` if the key is not in the cache — use `insert` to
-    /// write a new key. There is no `get_mut`. Acquires a write lock on the key's shard.
+    /// Returns `Err(CacheError::KeyNotExist)` if the key is not in the cache or has expired — use
+    /// `insert` to write a new key. There is no `get_mut`. Acquires a write lock on the key's shard.
     pub async fn update<Q>(&self, key: &Q, value: V) -> Result<(), CacheError>
     where
         K: std::borrow::Borrow<Q>,
@@ -181,6 +187,6 @@ where
 
     /// Returns the number of shards.
     pub fn num_shards(&self) -> usize {
-        usize::from(self.inner.num_shards)
+        self.inner.num_shards as usize
     }
 }

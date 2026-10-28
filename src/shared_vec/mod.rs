@@ -170,7 +170,7 @@ impl<K: Hash + Eq, V: Clone> SharedVecRef<K, V> {
 
     /// Write entry and increment len.
     unsafe fn push_item(&mut self, entry: CacheEntry<K, V>) {
-        debug_assert!(self.len < self.cap,);
+        assert!(self.len < self.cap);
         unsafe {
             let ptr = self.ptr.add(self.len).as_mut();
             std::ptr::write(ptr, MaybeUninit::new(entry));

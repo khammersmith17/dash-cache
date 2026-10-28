@@ -236,27 +236,13 @@ where
         self.slab.len()
     }
 
-    /// Promote an entry to head.
-    pub(crate) fn promote(&mut self, entry_idx: u32) {
-        debug_assert!(self.head.is_some());
-        let head_idx = self.head.unwrap();
-        if head_idx != entry_idx {
-            self.unlink_node(entry_idx);
-            self.push_node_to_head(entry_idx);
-        }
-    }
-
     // Promotes the entry at `entry_idx` to the head of the recency list and overwrites its value.
     // Safety: `entry_idx` must be a valid index into `self.slab`, obtained from `node_map`.
     // The cache must be non-empty when this is called (debug-asserted).
     #[inline(always)]
     fn update_cache_entry(&mut self, entry_idx: u32, value: V, expires: u64) {
         debug_assert!(self.head.is_some());
-        let head_idx = self.head.unwrap();
-        if head_idx != entry_idx {
-            self.unlink_node(entry_idx);
-            self.push_node_to_head(entry_idx);
-        }
+        self.promote_existing_entry(entry_idx);
 
         let entry = self.slab.get_entry_mut(entry_idx as usize);
         entry.value = value;
@@ -265,8 +251,8 @@ where
 
     /// Updates the value for an existing key and promotes it to most recently used.
     ///
-    /// Returns `Err(CacheError::KeyNotExist)` if the key is not in the cache. Use `insert` to
-    /// write a new key. There is no `get_mut` — this is the correct method for mutating a stored
+    /// Returns `Err(CacheError::KeyNotExist)` if the key is not in the cache or has expired. Use
+    /// `insert` to write a new key. There is no `get_mut` — this is the correct method for mutating a stored
     /// value.
     pub fn update<Q>(&mut self, key: &Q, value: V) -> Result<(), CacheError>
     where
@@ -294,6 +280,11 @@ where
         let Some(entry_idx) = self.node_map.get(key) else {
             return Err(CacheError::KeyNotExist);
         };
+
+        if !self.slab.get_entry(*entry_idx as usize).is_live() {
+            return Err(CacheError::KeyNotExist);
+        }
+
         self.stats.hit();
         self.update_cache_entry(*entry_idx, value, util::expires_from_ttl(ttl));
 
@@ -303,8 +294,8 @@ where
     /// Updates the value for an existing key along with the item's ttl and promotes it to
     /// most recently used.
     ///
-    /// Returns `Err(CacheError::KeyNotExist)` if the key is not in the cache. Use `insert` to
-    /// write a new key. There is no `get_mut` — this is the correct method for mutating a stored
+    /// Returns `Err(CacheError::KeyNotExist)` if the key is not in the cache or has expired. Use
+    /// `insert` to write a new key. There is no `get_mut` — this is the correct method for mutating a stored
     /// value.
     pub fn update_with_ttl<Q>(&mut self, key: &Q, value: V, ttl: Duration) -> Result<(), CacheError>
     where
@@ -396,8 +387,8 @@ where
     }
 
     pub(crate) fn evict_from_idx(&mut self, entry_idx: u32) {
-        let key = self.slab.get_entry(entry_idx as usize).key.clone();
-        let _ = self.node_map.remove(&key);
+        let node = &self.slab.get_entry(entry_idx as usize);
+        let _ = self.node_map.remove(&node.key);
         let _ = self.evict_entry(entry_idx);
     }
 
@@ -542,24 +533,30 @@ where
                     || (self.head.is_none() && self.tail.is_none())
             );
             debug_assert!((entry_idx as usize) < self.slab.len());
+
             let node = self.slab.get_entry_mut(entry_idx as usize);
             let (prev, next) = (node.prev(), node.next());
             debug_assert!(prev.is_none() && next.is_none());
         }
 
-        if let Some(head_idx) = self.head {
-            {
-                let node = self.slab.get_entry_mut(entry_idx as usize);
-                node.set_next(Some(head_idx));
-                node.set_prev(None);
+        match self.head {
+            Some(head_idx) if head_idx != entry_idx => {
+                {
+                    let node = self.slab.get_entry_mut(entry_idx as usize);
+                    node.set_next(Some(head_idx));
+                    node.set_prev(None);
+                }
+                self.slab
+                    .get_entry_mut(head_idx as usize)
+                    .set_prev(Some(entry_idx));
+                self.head = Some(entry_idx);
             }
-            self.slab
-                .get_entry_mut(head_idx as usize)
-                .set_prev(Some(entry_idx));
-            self.head = Some(entry_idx);
-        } else {
-            self.head = Some(entry_idx);
-            self.tail = Some(entry_idx);
+            None => {
+                self.head = Some(entry_idx);
+                self.tail = Some(entry_idx);
+            }
+            // Node is already head.
+            _ => {}
         }
     }
 
@@ -626,6 +623,47 @@ where
         GetResult::Hit(value, entry_idx)
     }
 
+    #[inline]
+    pub(crate) fn promote_key<Q>(&mut self, key: &Q)
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let Some(entry_idx) = self.node_map.get(key) else {
+            return;
+        };
+
+        self.promote_existing_entry(*entry_idx);
+    }
+
+    // Only should be called when promoting an entry on get
+    #[inline]
+    pub(crate) fn promote_existing_entry(&mut self, entry_idx: u32) {
+        debug_assert!(self.head.is_some());
+        let head_idx = self.head.unwrap();
+
+        if head_idx != entry_idx {
+            self.unlink_node(entry_idx);
+            self.push_node_to_head(entry_idx);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn evict_if_expired<Q>(&mut self, key: &Q)
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let Some(entry_idx) = self.node_map.get(key) else {
+            return;
+        };
+
+        if self.slab.get_entry(*entry_idx as usize).is_live() {
+            return;
+        }
+        self.evict_from_idx(*entry_idx);
+    }
+
     fn get_and_promote(&mut self, entry_idx: u32) -> Option<V> {
         if !self.is_entry_valid(entry_idx) {
             self.stats.expiration();
@@ -635,12 +673,7 @@ where
 
         self.stats.hit();
 
-        let head_idx = self.head.unwrap();
-        if head_idx != entry_idx {
-            self.unlink_node(entry_idx);
-            self.push_node_to_head(entry_idx);
-        }
-
+        self.promote_existing_entry(entry_idx);
         let value = self.slab.get_entry(entry_idx as usize).value.clone();
         Some(value)
     }
