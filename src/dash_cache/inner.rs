@@ -2,7 +2,7 @@ use super::slab::{LockedCache, default_shard_count};
 use crate::core::CacheError;
 use crate::shared_vec::{SharedVec, SharedVecRef};
 use crate::stats::CacheStats;
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::{BuildHasher, Hash};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,7 +40,7 @@ where
             .unwrap_or_else(|| default_shard_count(cap.get()));
 
         // Round up so total capacity is evenly divisible by shard_count.
-        let shard_capacity = (cap.get() + shard_count - 1) / shard_count;
+        let shard_capacity = cap.get().div_ceil(shard_count);
         let total_capacity = shard_capacity * shard_count;
 
         let shared_vec = Arc::new(SharedVec::new(
@@ -147,9 +147,7 @@ where
     where
         Q: Hash + ?Sized,
     {
-        let mut hasher = self.hasher.build_hasher();
-        key.hash(&mut hasher);
-        let hash = hasher.finish();
+        let hash = self.hasher.hash_one(key);
         // Take 32 bits from the middle of the hash (bits 25..=56), then map them onto
         // `0..num_shards` with a multiply-shift instead of a modulo.
         let h = (hash << 7) >> 32;

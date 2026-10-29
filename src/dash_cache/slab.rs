@@ -133,7 +133,7 @@ fn evict_on_writes<K, V, S, I>(
     }
 
     for key in keys.iter() {
-        slab.evict(&key);
+        slab.evict(key);
     }
 }
 

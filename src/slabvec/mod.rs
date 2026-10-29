@@ -13,7 +13,7 @@ impl<K: Hash + Eq, V: Clone> SlabVec<K, V> {
     }
 
     fn push(&mut self, entry: CacheEntry<K, V>) {
-        debug_assert!(self.0.len() < self.0.capacity());
+        assert!(self.0.len() < self.0.capacity());
         self.0.push(entry);
     }
 

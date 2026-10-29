@@ -35,13 +35,15 @@ use std::num::NonZeroUsize;
 use std::ptr::{NonNull, slice_from_raw_parts_mut};
 use std::sync::Arc;
 
+type SharedVecSource<K, V> = Arc<UnsafeCell<[MaybeUninit<CacheEntry<K, V>>]>>;
+
 /// Owner of the single contiguous slab allocation shared across all shards.
 ///
 /// Constructed once during cache initialisation. Must be kept alive for the
 /// lifetime of the cache so the backing memory is not freed.
 #[derive(Debug)]
 pub(crate) struct SharedVec<K: Hash + Eq, V: Clone> {
-    source: Arc<UnsafeCell<[MaybeUninit<CacheEntry<K, V>>]>>,
+    source: SharedVecSource<K, V>,
     num_shards: usize,
 }
 
@@ -80,8 +82,7 @@ fn compute_shard_base_ptr<K: Hash + Eq, V: Clone>(
     shard_idx: usize,
     shard_len: usize,
 ) -> *mut MaybeUninit<CacheEntry<K, V>> {
-    let shard_start_ptr = unsafe { base_ptr.add(shard_idx * shard_len) };
-    shard_start_ptr
+    unsafe { base_ptr.add(shard_idx * shard_len) }
 }
 
 impl<K: Hash + Eq, V: Clone> SharedVec<K, V> {
@@ -202,8 +203,12 @@ impl<K: Hash + Eq, V: Clone> SharedVecRef<K, V> {
 
     /// Manually drop all entries in the slab slice. Required as entries are MaybeUninit.
     fn drop_entries(&mut self) {
-        for i in 0..self.len {
-            unsafe { self.ptr.add(i).as_mut().assume_init_drop() }
+        let size = std::mem::replace(&mut self.len, 0_usize);
+        unsafe {
+            std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
+                self.ptr.as_ptr() as *mut CacheEntry<K, V>,
+                size,
+            ))
         }
     }
 }

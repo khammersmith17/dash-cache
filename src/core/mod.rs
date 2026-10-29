@@ -1,14 +1,17 @@
-use crate::backend::SlabBackend;
-use crate::entry::CacheEntry;
-use crate::slabvec::SlabVec;
-use crate::stats::{CacheStats, LocalStats, Stats};
-use crate::util;
-use std::collections::HashMap;
-use std::collections::hash_map::Entry;
-use std::hash::{BuildHasher, Hash};
-use std::marker::PhantomData;
-use std::num::NonZeroUsize;
-use std::time::Duration;
+use crate::{
+    backend::{SlabBackend, SlabClear},
+    entry::CacheEntry,
+    slabvec::SlabVec,
+    stats::{CacheStats, LocalStats, Stats},
+    util,
+};
+use std::{
+    collections::hash_map::{Entry, HashMap},
+    hash::{BuildHasher, Hash},
+    marker::PhantomData,
+    num::NonZeroUsize,
+    time::Duration,
+};
 use thiserror::Error;
 
 /// Covers the three cases for a get operation that is queued in [crate::dash_cache::DashCache].
@@ -333,7 +336,8 @@ where
         K: std::borrow::Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let entry_idx = self.node_map.remove(key)?;
+        // Wait to drop key, possibly a user defined function.
+        let (_key, entry_idx) = self.node_map.remove_entry(key)?;
         Some(self.evict_entry(entry_idx))
     }
 
@@ -351,11 +355,9 @@ where
         let len = self.len();
         if len > 1 && entry_idx as usize != len - 1 {
             let entry = self.slab.get_entry(len - 1);
-            let swap_key = entry.key.clone();
             let swap_prev = entry.prev();
             let swap_next = entry.next();
-
-            *self.node_map.get_mut(&swap_key).unwrap() = entry_idx;
+            *self.node_map.get_mut(&entry.key).unwrap() = entry_idx;
 
             if let Some(swap_prev) = swap_prev {
                 debug_assert!((swap_prev as usize) < self.slab.len());
@@ -387,8 +389,10 @@ where
     }
 
     pub(crate) fn evict_from_idx(&mut self, entry_idx: u32) {
-        let node = &self.slab.get_entry(entry_idx as usize);
-        let _ = self.node_map.remove(&node.key);
+        let entry = &self.slab.get_entry(entry_idx as usize);
+
+        // Wait to drop key, possibly a user defined function.
+        let (_key, entry_idx) = self.node_map.remove_entry(&entry.key).unwrap();
         let _ = self.evict_entry(entry_idx);
     }
 
@@ -424,6 +428,9 @@ where
     }
 
     fn insert_entry(&mut self, key: K, value: V, expires: u64) {
+        // Container to store user fields, so they are not dropped until the end of the cache state
+        // update. Drop may be user defined and may panic.
+        let mut _evicted: Option<(K, K, V)> = None;
         let idx = if self.is_full() {
             match self.node_map.get(&key) {
                 Some(entry_idx) => {
@@ -431,15 +438,22 @@ where
                     return;
                 }
                 None => {
-                    let stale_idx = self.pop_tail();
+                    // Call user defined Clone implementation before an entering any unsafe
+                    // sections.
+                    let new_key = key.clone();
+                    let (stale_map_key, stale_idx) = self.pop_tail();
+
                     debug_assert!((stale_idx as usize) < self.slab.len());
-                    {
-                        let stale_entry = self.slab.get_entry_mut(stale_idx as usize);
-                        stale_entry.key = key.clone();
-                        stale_entry.value = value;
-                        stale_entry.clear_neighbors();
-                        stale_entry.expires = expires;
-                    }
+                    let stale_entry = self.slab.get_entry_mut(stale_idx as usize);
+
+                    let stale_slab_key = std::mem::replace(&mut stale_entry.key, new_key);
+                    let stale_value = std::mem::replace(&mut stale_entry.value, value);
+                    let _ = std::mem::replace(&mut stale_entry.expires, expires);
+
+                    // Watit until cache state is consistent to call user defined drop
+                    // implementation. Both copies of the key (map and slab) are held.
+                    _evicted = Some((stale_map_key, stale_slab_key, stale_value));
+                    stale_entry.clear_neighbors();
                     self.node_map.insert(key, stale_idx);
                     stale_idx
                 }
@@ -469,8 +483,11 @@ where
     pub fn drain(&mut self) {
         self.head = None;
         self.tail = None;
+
+        // Registr clear handle before.
+        // When `clear` is called on the map, a user defined Drop function may panic.
+        let _handle = SlabClear::new(&mut self.slab);
         self.node_map.clear();
-        self.slab.clear();
     }
 
     #[inline(always)]
@@ -561,7 +578,7 @@ where
     }
 
     #[inline(always)]
-    fn pop_tail(&mut self) -> u32 {
+    fn pop_tail(&mut self) -> (K, u32) {
         #[cfg(debug_assertions)]
         {
             debug_assert!(
@@ -573,11 +590,14 @@ where
         }
 
         let tail_idx = self.tail.unwrap();
-        self.unlink_node(tail_idx);
         self.stats.eviction();
 
-        let key = self.slab.get_entry(tail_idx as usize).key.clone();
-        self.node_map.remove(&key).unwrap()
+        let tail_entry = self.slab.get_entry(tail_idx as usize);
+
+        // Wait to drop key, possibly a user defined function.
+        let (key, entry_idx) = self.node_map.remove_entry(&tail_entry.key).unwrap();
+        self.unlink_node(tail_idx);
+        (key, entry_idx)
     }
 
     /// Returns a clone of the value for the given key and promotes it to most recently used.
