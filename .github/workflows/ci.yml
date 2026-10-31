@@ -62,7 +62,7 @@ jobs:
         # Several seeds, so the probe sees different thread interleavings.
         env:
           MIRIFLAGS: -Zmiri-many-seeds=0..8
-        run: cargo miri test --lib --test miri_probe
+        run: cargo miri test --lib --test miri_probe --test panic_safety
 
   publish-dry-run:
     name: Publish dry run

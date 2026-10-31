@@ -405,7 +405,7 @@ where
     /// Returns `true` if the cache is at capacity. The next insert of a new key will evict the
     /// least recently used entry.
     pub fn is_full(&self) -> bool {
-        self.node_map.len() == self.cap
+        self.slab.len() == self.cap
     }
 
     /// Insert a new item into the cache with a non default TTL. If the item already exists, then

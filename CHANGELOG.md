@@ -4,6 +4,9 @@
 
 ### Bug fixes
 
+- **A panic in a user's `Clone` or `Drop` no longer corrupts a shard.** Shard operations called user code partway through updating the key map, the recency list and the slab, so a panic could leave an entry in the slab that the map and list no longer tracked. The shard then rejected every new insert, and in release builds the next insert wrote past the shard's capacity, and stale list indices could be read out of bounds. Both are undefined behavior. User code now runs before the shard is mutated, and evicted keys and values are dropped only once it is consistent again. This matters most for `DashCache`, where a panic in one task leaves the shard in use by every other task.
+- `SharedVecRef::clear` no longer drops entries twice if one entry's `Drop` panics. `SlabShard::drain` now clears the slab even if dropping a key in the map panics.
+- `SlabVec::push` now checks `len < capacity` in release builds too.
 - When a `DashCache` shard's promotion or eviction queue fills up, the `get` that finds it full now takes the shard's write lock and drains both queues early, then applies its own promotion or eviction by key. Previously, promotions and evictions pushed to a full queue were silently dropped.
 - `update` and `update_with_ttl` now return `Err(CacheError::KeyNotExist)` for an expired entry instead of updating it in place.
 - `SharedVecRef::push_item` now checks `len < cap` in release builds too (`assert!` instead of `debug_assert!`), so an out-of-bounds write panics instead of corrupting memory.
@@ -12,6 +15,10 @@
 
 - `DashCache` shard routing uses a multiply-shift range reduction on 32 bits from the middle of the key's hash instead of `hash % num_shards`.
 - Remove the manual `unsafe impl Send + Sync` for `CacheQueue`; it is now made only of atomics, so both are derived automatically.
+
+### CI
+
+- Add a `panic_safety` integration test that injects panics into user `Clone` and `Drop` implementations and checks each shard stays usable. It also runs in the Miri job.
 
 ## [0.2.2]
 

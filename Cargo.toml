@@ -40,6 +40,10 @@ path = "integration-tests/concurrent_stress.rs"
 name = "miri_probe"
 path = "integration-tests/miri_probe.rs"
 
+[[test]]
+name = "panic_safety"
+path = "integration-tests/panic_safety.rs"
+
 [[bench]]
 name = "put_then_get_with_eviction"
 harness = false
