@@ -20,6 +20,10 @@ impl Default for CacheQueue {
 }
 
 impl CacheQueue {
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     pub(crate) fn new(queue_size: usize) -> CacheQueue {
         let buffer = (0..queue_size).map(|_| AtomicU32::new(0_u32)).collect();
         let tail = AtomicUsize::new(0_usize);

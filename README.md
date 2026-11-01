@@ -3,7 +3,7 @@
 
 
 # dash-cache
-This package is an efficient LRU cache implementation. This implementation is different than a typical LRU cache implementation in that all entries are stored in a contiguous buffer, and the list is tracked using offsets into this buffer, rather than pointers. This introduces some CPU cache performance benefit, as observed in the benchmark numbers below. Additionally, in the concurrent data structure, all promotions and time based evictions are queued until the next write (or until a queue fills up), keeping reads cheap and amortizing bookkeeping by performing them only on writes.
+This package is an efficient LRU cache implementation. This implementation is different than a typical LRU cache implementation in that all entries are stored in a contiguous buffer, and the list is tracked using offsets into this buffer, rather than pointers. This introduces some CPU cache performance benefit, as observed in the benchmark numbers below. Additionally, in the concurrent data structure, all promotions and time based evictions are queued until the next write, and never dropped, keeping reads cheap and amortizing bookkeeping by performing them only on writes.
 
 The thread safe implementation is dubbed DashCache, as an homage to DashMap. As such, the internal structure is a sharded LRU Cache for performant concurrent access. Shard count can be defined by the user, or defaults to four shards per CPU core, reduced for small caches so that each shard holds at least 8 entries. Given the sharded nature, each key value pair priority is local to the cache shard and not a total least recently used ordering. This is of course not a characteristic of the single threaded version.
 

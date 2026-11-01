@@ -643,19 +643,6 @@ where
         GetResult::Hit(value, entry_idx)
     }
 
-    #[inline]
-    pub(crate) fn promote_key<Q>(&mut self, key: &Q)
-    where
-        K: std::borrow::Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
-    {
-        let Some(entry_idx) = self.node_map.get(key) else {
-            return;
-        };
-
-        self.promote_existing_entry(*entry_idx);
-    }
-
     // Only should be called when promoting an entry on get
     #[inline]
     pub(crate) fn promote_existing_entry(&mut self, entry_idx: u32) {
@@ -666,22 +653,6 @@ where
             self.unlink_node(entry_idx);
             self.push_node_to_head(entry_idx);
         }
-    }
-
-    #[inline]
-    pub(crate) fn evict_if_expired<Q>(&mut self, key: &Q)
-    where
-        K: std::borrow::Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
-    {
-        let Some(entry_idx) = self.node_map.get(key) else {
-            return;
-        };
-
-        if self.slab.get_entry(*entry_idx as usize).is_live() {
-            return;
-        }
-        self.evict_from_idx(*entry_idx);
     }
 
     fn get_and_promote(&mut self, entry_idx: u32) -> Option<V> {
