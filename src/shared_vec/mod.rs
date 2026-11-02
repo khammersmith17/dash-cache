@@ -25,15 +25,16 @@
 //! * Elements are stored as `MaybeUninit<CacheEntry<K, V>>`. Only indices `0..len` are
 //!   initialised; reads outside that range are undefined behaviour.
 
-use crate::backend::SlabBackend;
-use crate::entry::CacheEntry;
-use std::alloc::{Layout, alloc};
-use std::cell::UnsafeCell;
-use std::hash::Hash;
-use std::mem::MaybeUninit;
-use std::num::NonZeroUsize;
-use std::ptr::{NonNull, slice_from_raw_parts_mut};
-use std::sync::Arc;
+use crate::{backend::SlabBackend, entry::CacheEntry};
+use std::{
+    alloc::{Layout, alloc},
+    cell::UnsafeCell,
+    hash::Hash,
+    mem::MaybeUninit,
+    num::NonZeroUsize,
+    ptr::{NonNull, slice_from_raw_parts_mut},
+    sync::Arc,
+};
 
 type SharedVecSource<K, V> = Arc<UnsafeCell<[MaybeUninit<CacheEntry<K, V>>]>>;
 

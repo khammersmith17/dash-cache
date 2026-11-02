@@ -1,5 +1,4 @@
-use crate::backend::SlabBackend;
-use crate::entry::CacheEntry;
+use crate::{backend::SlabBackend, entry::CacheEntry};
 use std::hash::Hash;
 
 /// Type wrapper around Vec<Entry<K, V>>, in order to implement [SlabBackend].

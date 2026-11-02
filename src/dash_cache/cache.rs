@@ -1,9 +1,10 @@
 use super::inner::InnerCacheShards;
-use crate::core::CacheError;
-use crate::guard::CacheEntryGuard;
-use std::hash::{BuildHasher, Hash};
-use std::sync::Arc;
-use std::time::Duration;
+use crate::{core::CacheError, guard::CacheEntryGuard};
+use std::{
+    hash::{BuildHasher, Hash},
+    sync::Arc,
+    time::Duration,
+};
 
 /// A concurrent, sharded LRU cache inspired by `DashMap`.
 ///

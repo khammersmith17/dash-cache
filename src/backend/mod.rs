@@ -19,6 +19,7 @@ pub(crate) trait SlabBackend<K: Hash + Eq, V: Clone> {
     fn clear(&mut self);
 }
 
+/// Container to ensure the slab is cleared safely even when user code panics.
 pub(crate) struct SlabClear<'a, K, V, Sl>
 where
     K: Hash + Eq,
@@ -46,6 +47,7 @@ where
 }
 
 impl<'a, K: Hash + Eq, V: Clone, Sl: SlabBackend<K, V>> Drop for SlabClear<'a, K, V, Sl> {
+    // Clear the slab when the wrapper is dropped to ensure the slab is safely cleared.
     fn drop(&mut self) {
         self.slab.clear();
     }

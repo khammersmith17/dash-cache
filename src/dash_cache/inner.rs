@@ -1,11 +1,15 @@
 use super::slab::{LockedCache, default_shard_count};
-use crate::core::CacheError;
-use crate::shared_vec::{SharedVec, SharedVecRef};
-use crate::stats::CacheStats;
-use std::hash::{BuildHasher, Hash};
-use std::num::NonZeroUsize;
-use std::sync::Arc;
-use std::time::Duration;
+use crate::{
+    core::CacheError,
+    shared_vec::{SharedVec, SharedVecRef},
+    stats::CacheStats,
+};
+use std::{
+    hash::{BuildHasher, Hash},
+    num::NonZeroUsize,
+    sync::Arc,
+    time::Duration,
+};
 
 // Owns the shard array and routes all operations to the correct shard via key hash.
 #[derive(Debug)]

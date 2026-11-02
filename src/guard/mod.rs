@@ -1,6 +1,8 @@
 use crate::dash_cache::DashCache;
-use std::hash::{BuildHasher, Hash};
-use std::ops::{Deref, DerefMut};
+use std::{
+    hash::{BuildHasher, Hash},
+    ops::{Deref, DerefMut},
+};
 use tokio::runtime::Handle;
 
 /// A value checked out of a [`DashCache`] by [`DashCache::checkout`].

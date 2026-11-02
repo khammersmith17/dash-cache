@@ -1,11 +1,12 @@
-use super::cache::DashCache;
-use super::inner::InnerCacheShards;
+use super::{cache::DashCache, inner::InnerCacheShards};
 use crate::queue;
-use std::hash::{BuildHasher, Hash};
-use std::marker::PhantomData;
-use std::num::NonZeroUsize;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    hash::{BuildHasher, Hash},
+    marker::PhantomData,
+    num::NonZeroUsize,
+    sync::Arc,
+    time::Duration,
+};
 
 /// Builder for [`DashCache`].
 ///

@@ -1,12 +1,16 @@
-use crate::core::{CacheError, GetResult, SlabShard, SlabShardBuilder};
-use crate::queue::{self, CacheQueue};
-use crate::shared_vec::SharedVecRef;
-use crate::stats::{AtomicStats, CacheStats};
-use std::collections::HashSet;
-use std::hash::{BuildHasher, Hash};
-use std::num::NonZeroUsize;
-use std::sync::Mutex;
-use std::time::Duration;
+use crate::{
+    core::{CacheError, GetResult, SlabShard, SlabShardBuilder},
+    queue::{self, CacheQueue},
+    shared_vec::SharedVecRef,
+    stats::{AtomicStats, CacheStats},
+};
+use std::{
+    collections::HashSet,
+    hash::{BuildHasher, Hash},
+    num::NonZeroUsize,
+    sync::Mutex,
+    time::Duration,
+};
 use tokio::sync::RwLock;
 
 // The initial capacity provided to the overflow queues when used.

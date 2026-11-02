@@ -18,10 +18,12 @@
 
 use dash_cache::{DashCacheBuilder, SlabShard};
 use futures::executor::block_on;
-use std::cell::Cell;
-use std::num::NonZeroUsize;
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Once;
+use std::{
+    cell::Cell,
+    num::NonZeroUsize,
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::Once,
+};
 
 const CAP: usize = 8;
 const INJECTED: &str = "injected panic";
