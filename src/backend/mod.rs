@@ -18,3 +18,37 @@ pub(crate) trait SlabBackend<K: Hash + Eq, V: Clone> {
     // Clear the entry.
     fn clear(&mut self);
 }
+
+/// Container to ensure the slab is cleared safely even when user code panics.
+pub(crate) struct SlabClear<'a, K, V, Sl>
+where
+    K: Hash + Eq,
+    V: Clone,
+    Sl: SlabBackend<K, V>,
+{
+    slab: &'a mut Sl,
+    _key: std::marker::PhantomData<K>,
+    _value: std::marker::PhantomData<V>,
+}
+
+impl<'a, K, V, Sl> SlabClear<'a, K, V, Sl>
+where
+    K: Hash + Eq,
+    V: Clone,
+    Sl: SlabBackend<K, V>,
+{
+    pub(crate) fn new(slab: &'a mut Sl) -> Self {
+        Self {
+            slab,
+            _key: std::marker::PhantomData,
+            _value: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<'a, K: Hash + Eq, V: Clone, Sl: SlabBackend<K, V>> Drop for SlabClear<'a, K, V, Sl> {
+    // Clear the slab when the wrapper is dropped to ensure the slab is safely cleared.
+    fn drop(&mut self) {
+        self.slab.clear();
+    }
+}

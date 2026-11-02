@@ -1,11 +1,12 @@
-use super::cache::DashCache;
-use super::inner::InnerCacheShards;
+use super::{cache::DashCache, inner::InnerCacheShards};
 use crate::queue;
-use std::hash::{BuildHasher, Hash};
-use std::marker::PhantomData;
-use std::num::NonZeroUsize;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    hash::{BuildHasher, Hash},
+    marker::PhantomData,
+    num::NonZeroUsize,
+    sync::Arc,
+    time::Duration,
+};
 
 /// Builder for [`DashCache`].
 ///
@@ -84,8 +85,9 @@ where
     /// of all list mutations to when a write lock is required.
     ///
     /// The value for the promotion queue size should be decided by evaluating how many reads might
-    /// be made to the same shard before a write. If the number of reads in a row to the same shard
-    /// exceeds this value, then some promotions may be dropped.
+    /// be made to the same shard before a write. Promotions are never dropped: if the number of
+    /// reads in a row to the same shard exceeds this value, further promotions go to an overflow
+    /// buffer, and a read drains both early once enough have built up.
     pub fn with_promotion_queue_size(
         &mut self,
         size: NonZeroUsize,
@@ -99,8 +101,9 @@ where
     /// of all list mutations to when a write lock is required.
     ///
     /// The value for the eviction queue size should be decided by evaluating how many reads might
-    /// be made to the same shard before a write. If the number of reads in a row to the same shard
-    /// exceeds this value, then some promotions may be dropped.
+    /// be made to the same shard before a write. Evictions are never dropped: if the number of
+    /// reads in a row to the same shard exceeds this value, further evictions go to an overflow
+    /// buffer, and a read drains both early once enough have built up.
     pub fn with_eviction_queue_size(
         &mut self,
         size: NonZeroUsize,

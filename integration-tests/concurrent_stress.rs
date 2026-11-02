@@ -3,10 +3,8 @@
 /// Spawns many Tokio tasks performing interleaved inserts, gets, updates, and evictions
 /// against a shared cache. Designed to surface data races under ThreadSanitizer and
 /// exercise the full concurrent code path at a scale beyond the unit tests.
-use dash_cache::DashCache;
-use dash_cache::DashCacheBuilder;
-use std::num::NonZeroUsize;
-use std::sync::Arc;
+use dash_cache::{DashCache, DashCacheBuilder};
+use std::{num::NonZeroUsize, sync::Arc};
 use tokio::task::JoinSet;
 
 const TASKS: usize = 16;

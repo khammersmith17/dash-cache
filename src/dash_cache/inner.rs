@@ -1,11 +1,15 @@
 use super::slab::{LockedCache, default_shard_count};
-use crate::core::CacheError;
-use crate::shared_vec::{SharedVec, SharedVecRef};
-use crate::stats::CacheStats;
-use std::hash::{BuildHasher, Hash, Hasher};
-use std::num::NonZeroUsize;
-use std::sync::Arc;
-use std::time::Duration;
+use crate::{
+    core::CacheError,
+    shared_vec::{SharedVec, SharedVecRef},
+    stats::CacheStats,
+};
+use std::{
+    hash::{BuildHasher, Hash},
+    num::NonZeroUsize,
+    sync::Arc,
+    time::Duration,
+};
 
 // Owns the shard array and routes all operations to the correct shard via key hash.
 #[derive(Debug)]
@@ -16,7 +20,7 @@ where
     S: BuildHasher + Send + Sync,
 {
     pub(super) cache_shards: Box<[LockedCache<K, V, S>]>,
-    pub(super) num_shards: NonZeroUsize,
+    pub(super) num_shards: u64,
     hasher: S,
     _shared_vec: Arc<SharedVec<K, V>>,
 }
@@ -40,7 +44,7 @@ where
             .unwrap_or_else(|| default_shard_count(cap.get()));
 
         // Round up so total capacity is evenly divisible by shard_count.
-        let shard_capacity = (cap.get() + shard_count - 1) / shard_count;
+        let shard_capacity = cap.get().div_ceil(shard_count);
         let total_capacity = shard_capacity * shard_count;
 
         let shared_vec = Arc::new(SharedVec::new(
@@ -69,7 +73,7 @@ where
         let num_shards = unsafe { NonZeroUsize::new_unchecked(shard_count) };
         InnerCacheShards {
             cache_shards,
-            num_shards,
+            num_shards: num_shards.get() as u64,
             hasher,
             _shared_vec: shared_vec,
         }
@@ -147,10 +151,11 @@ where
     where
         Q: Hash + ?Sized,
     {
-        let mut hasher = self.hasher.build_hasher();
-        key.hash(&mut hasher);
-        let hash_value = hasher.finish();
-        hash_value as usize % usize::from(self.num_shards)
+        let hash = self.hasher.hash_one(key);
+        // Take 32 bits from the middle of the hash (bits 25..=56), then map them onto
+        // `0..num_shards` with a multiply-shift instead of a modulo.
+        let h = (hash << 7) >> 32;
+        ((h * self.num_shards) >> 32) as usize
     }
 
     pub(super) async fn contains<Q>(&self, key: &Q) -> bool

@@ -1,12 +1,24 @@
-use crate::core::{CacheError, GetResult, SlabShard, SlabShardBuilder};
-use crate::queue::{self, CacheQueue};
-use crate::shared_vec::SharedVecRef;
-use crate::stats::{AtomicStats, CacheStats};
-use std::collections::HashSet;
-use std::hash::{BuildHasher, Hash};
-use std::num::NonZeroUsize;
-use std::time::Duration;
+use crate::{
+    core::{CacheError, GetResult, SlabShard, SlabShardBuilder},
+    queue::{self, CacheQueue},
+    shared_vec::SharedVecRef,
+    stats::{AtomicStats, CacheStats},
+};
+use std::{
+    collections::HashSet,
+    hash::{BuildHasher, Hash},
+    num::NonZeroUsize,
+    sync::Mutex,
+    time::Duration,
+};
 use tokio::sync::RwLock;
+
+// The initial capacity provided to the overflow queues when used.
+const OVERFLOW_QUEUE_INITIAL_SIZE: usize = 32_usize;
+
+// Multiplier that determines how much the queued cache state updates can overflow.
+// Used to bound the memory of the eviction and promotion queues.
+const FORCED_DRAIN_MULTIPLE: usize = 2_usize;
 
 // Slab type couples the cache shard and the promotion queue together.
 //
@@ -31,6 +43,8 @@ where
     shard: SlabShard<K, V, S, AtomicStats, SharedVecRef<K, V>>,
     promotion: CacheQueue,
     eviction: CacheQueue,
+    promotion_overflow: Mutex<Vec<u32>>,
+    eviction_overflow: Mutex<Vec<u32>>,
     eviction_keys: HashSet<K>,
 }
 
@@ -46,11 +60,78 @@ where
         promotion_queue_size: usize,
     ) -> Slab<K, V, S> {
         Slab {
+            shard,
             promotion: CacheQueue::new(promotion_queue_size),
             eviction: CacheQueue::new(eviction_queue_size),
+            promotion_overflow: Mutex::new(Vec::new()),
+            eviction_overflow: Mutex::new(Vec::new()),
             eviction_keys: HashSet::with_capacity(queue::DEFAULT_BUFFER_SIZE),
-            shard,
         }
+    }
+
+    /// Decide whether an early drain should occur to bound consumed memory.
+    /// Only one caller will be assigned the early promotion for each type.
+    /// In the case that two callers trigger a drain from the promotion queue and eviction queue
+    /// separately, then two callers will trigger the drain.
+    ///
+    /// In all other cases, only one caller will attempt the lock upgrade.
+    fn should_drain_early(&self, handle_size: usize, capacity: usize) -> bool {
+        let drain_factor = capacity * (FORCED_DRAIN_MULTIPLE - 1);
+        // If the queue is at capacity, and a multiple of the capacity.
+        // In this case, only one held read lock attempts to acquire the write lock.
+        // If the task is canceled, then the next caller at multiple of `drain_factor`
+        // will perform the drain.
+        (handle_size >= drain_factor) && handle_size.is_multiple_of(drain_factor)
+    }
+
+    /// Queue an entries promotion. If the concurrent queue is full, write to the overflow queue.
+    /// The overflow queue is only allocated capacity when it is needed.
+    /// Returns to the caller if an early drain should occur.
+    #[must_use]
+    fn queue_promotion(&self, entry_idx: u32) -> bool {
+        if self.promotion.try_push(entry_idx).is_err() {
+            let mut handle = self.promotion_overflow.lock().unwrap();
+
+            // Lazily provide the overflow queue with capacity.
+            if handle.is_empty() {
+                handle.reserve(OVERFLOW_QUEUE_INITIAL_SIZE);
+            }
+            handle.push(entry_idx);
+            return self.should_drain_early(handle.len(), self.promotion.capacity());
+        }
+        false
+    }
+
+    /// Queue an entries eviction. If the concurrent queue is full, write to the overflow queue.
+    /// The overflow queue is only allocated capacity when it is needed.
+    /// Returns to the caller if an early drain should occur.
+    #[must_use]
+    fn queue_eviction(&self, entry_idx: u32) -> bool {
+        if self.eviction.try_push(entry_idx).is_err() {
+            let mut handle = self.eviction_overflow.lock().unwrap();
+
+            // Lazily provide the overflow queue with capacity.
+            if handle.is_empty() {
+                handle.reserve(OVERFLOW_QUEUE_INITIAL_SIZE);
+            }
+            handle.push(entry_idx);
+
+            return self.should_drain_early(handle.len(), self.eviction.capacity());
+        }
+        false
+    }
+
+    fn drain_queues(&mut self) {
+        // Replace with an empty Vec so space is only allocated when it is needed.
+        let promotion_overflow = std::mem::take(self.promotion_overflow.get_mut().unwrap());
+        let eviction_overflow = std::mem::take(self.eviction_overflow.get_mut().unwrap());
+
+        perform_queued_actions(
+            self.promotion.drain().chain(promotion_overflow),
+            self.eviction.drain().chain(eviction_overflow),
+            &mut self.shard,
+            &mut self.eviction_keys,
+        );
     }
 }
 
@@ -70,7 +151,7 @@ pub(super) fn default_shard_count(capacity: usize) -> usize {
 }
 
 // Performs all required state updates queued on the acquisition of the write lock.
-fn perform_cleanup<K, V, S, I>(
+fn perform_queued_actions<K, V, S, I>(
     promotions: I,
     evictions: I,
     slab: &mut SlabShard<K, V, S, AtomicStats, SharedVecRef<K, V>>,
@@ -99,7 +180,7 @@ fn promote_on_writes<K, V, S, I>(
     // promotion is a no-op. Duplicate promotions in this queue also maintain correct state. A
     // promotion does not mutate the slab, rather only mutates the list pointers.
     for entry in promotions {
-        slab.promote(entry);
+        slab.promote_existing_entry(entry);
     }
 }
 
@@ -133,7 +214,7 @@ fn evict_on_writes<K, V, S, I>(
     }
 
     for key in keys.iter() {
-        slab.evict(&key);
+        slab.evict(key);
     }
 }
 
@@ -177,14 +258,8 @@ where
 
     pub(super) async fn insert_with_ttl(&self, key: K, value: V, ttl: Duration) {
         let mut guard = self.handle.write().await;
-        let Slab {
-            ref mut promotion,
-            ref mut shard,
-            ref mut eviction,
-            ref mut eviction_keys,
-        } = *guard;
-        perform_cleanup(promotion.drain(), eviction.drain(), shard, eviction_keys);
-        shard.insert_with_ttl(key, value, ttl);
+        guard.drain_queues();
+        guard.shard.insert_with_ttl(key, value, ttl);
     }
 
     pub(super) async fn checkout<Q>(&self, key: &Q) -> Option<(K, V, u64)>
@@ -193,29 +268,17 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let mut guard = self.handle.write().await;
-        let Slab {
-            ref mut promotion,
-            ref mut shard,
-            ref mut eviction,
-            ref mut eviction_keys,
-        } = *guard;
-
         // This is not a write operation, but does take a write lock.
         // Given the held write lock, any reads are promoted.
-        perform_cleanup(promotion.drain(), eviction.drain(), shard, eviction_keys);
-        shard.evict_full_entry(key)
+
+        guard.drain_queues();
+        guard.shard.evict_full_entry(key)
     }
 
     pub(super) async fn insert_with_expires(&self, key: K, value: V, expires: u64) {
         let mut guard = self.handle.write().await;
-        let Slab {
-            ref mut promotion,
-            ref mut shard,
-            ref mut eviction,
-            ref mut eviction_keys,
-        } = *guard;
-        perform_cleanup(promotion.drain(), eviction.drain(), shard, eviction_keys);
-        shard.insert_with_expires(key, value, expires);
+        guard.drain_queues();
+        guard.shard.insert_with_expires(key, value, expires);
     }
 
     pub(super) async fn update_with_ttl<Q>(
@@ -229,14 +292,8 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let mut guard = self.handle.write().await;
-        let Slab {
-            ref mut promotion,
-            ref mut shard,
-            ref mut eviction,
-            ref mut eviction_keys,
-        } = *guard;
-        perform_cleanup(promotion.drain(), eviction.drain(), shard, eviction_keys);
-        shard.update_with_ttl(key, value, ttl)?;
+        guard.drain_queues();
+        guard.shard.update_with_ttl(key, value, ttl)?;
 
         Ok(())
     }
@@ -249,26 +306,14 @@ where
 
     pub(super) async fn insert(&self, key: K, value: V) {
         let mut guard = self.handle.write().await;
-        let Slab {
-            ref mut promotion,
-            ref mut shard,
-            ref mut eviction,
-            ref mut eviction_keys,
-        } = *guard;
-        perform_cleanup(promotion.drain(), eviction.drain(), shard, eviction_keys);
-        shard.insert(key, value)
+        guard.drain_queues();
+        guard.shard.insert(key, value)
     }
 
     pub(super) async fn drain(&self) {
         let mut guard = self.handle.write().await;
-        let Slab {
-            ref mut promotion,
-            ref mut shard,
-            ref mut eviction,
-            ref mut eviction_keys,
-        } = *guard;
-        perform_cleanup(promotion.drain(), eviction.drain(), shard, eviction_keys);
-        shard.drain();
+        guard.drain_queues();
+        guard.shard.drain();
     }
 
     pub(super) async fn statistics(&self) -> CacheStats {
@@ -283,23 +328,34 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let guard = self.handle.read().await;
-        let Slab {
-            ref shard,
-            ref promotion,
-            ref eviction,
-            ..
-        } = *guard;
-        match shard.get_no_promote(key) {
+
+        // Attempt to get without promoting/evicting.
+        // If either queue is full, drop the read lock, acquire the write lock and performed the
+        // queued operations.
+        match guard.shard.get_no_promote(key) {
             GetResult::Miss => None,
             GetResult::Hit(v, entry_idx) => {
-                promotion.push(entry_idx);
+                if guard.queue_promotion(entry_idx) {
+                    drop(guard);
+                    self.early_drain().await;
+                };
                 Some(v)
             }
             GetResult::Expired(entry_idx) => {
-                eviction.push(entry_idx);
+                if guard.queue_eviction(entry_idx) {
+                    drop(guard);
+                    self.early_drain().await;
+                };
                 None
             }
         }
+    }
+
+    // When the queue has reached overflow capacity, perform all the queued actions on a read
+    // action.
+    async fn early_drain(&self) {
+        let mut guard = self.handle.write().await;
+        guard.drain_queues();
     }
 
     pub(super) async fn evict<Q>(&self, key: &Q) -> Option<V>
@@ -308,14 +364,8 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let mut guard = self.handle.write().await;
-        let Slab {
-            ref mut shard,
-            ref mut promotion,
-            ref mut eviction,
-            ref mut eviction_keys,
-        } = *guard;
-        perform_cleanup(promotion.drain(), eviction.drain(), shard, eviction_keys);
-        shard.evict(key)
+        guard.drain_queues();
+        guard.shard.evict(key)
     }
 
     pub(super) async fn update<Q>(&self, key: &Q, value: V) -> Result<(), CacheError>
@@ -324,15 +374,9 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let mut guard = self.handle.write().await;
-        let Slab {
-            ref mut shard,
-            ref mut promotion,
-            ref mut eviction,
-            ref mut eviction_keys,
-        } = *guard;
-        perform_cleanup(promotion.drain(), eviction.drain(), shard, eviction_keys);
+        guard.drain_queues();
 
-        shard.update(key, value)?;
+        guard.shard.update(key, value)?;
         Ok(())
     }
 
@@ -344,5 +388,152 @@ where
         let guard = self.handle.read().await;
         let Slab { ref shard, .. } = *guard;
         shard.contains(key)
+    }
+}
+
+#[cfg(test)]
+mod early_drain_tests {
+    use super::*;
+    use crate::shared_vec::SharedVec;
+    use std::sync::Arc;
+
+    const CAP: usize = 8;
+    const QUEUE: usize = 4;
+    // Miri's clock advances with the instructions it interprets, so it needs a far longer timeout.
+    const TIMEOUT: Duration = Duration::from_secs(if cfg!(miri) { 600 } else { 5 });
+    const READS_PER_TASK: u64 = if cfg!(miri) { 50 } else { 500 };
+
+    // Overflow length at which a reader drains both queues early.
+    const DRAIN_AT: usize = QUEUE * (FORCED_DRAIN_MULTIPLE - 1);
+
+    // A single shard with its backing allocation. Fields drop in order, so the shard is dropped
+    // before the memory it points into.
+    struct TestShard {
+        cache: LockedCache<u64, u64>,
+        _backing: SharedVec<u64, u64>,
+    }
+
+    fn shard() -> TestShard {
+        let cap = NonZeroUsize::new(CAP).unwrap();
+        let backing = SharedVec::new(cap, NonZeroUsize::new(1).unwrap());
+        let slab_ref = backing.make_shards().pop().unwrap();
+        let cache = LockedCache::new(
+            slab_ref,
+            cap,
+            ahash::RandomState::with_seeds(1, 2, 3, 4),
+            QUEUE,
+            QUEUE,
+            None,
+        );
+        TestShard {
+            cache,
+            _backing: backing,
+        }
+    }
+
+    async fn promotion_overflow_len(cache: &LockedCache<u64, u64>) -> usize {
+        cache
+            .handle
+            .read()
+            .await
+            .promotion_overflow
+            .lock()
+            .unwrap()
+            .len()
+    }
+
+    // Regression test: the reader that triggered the early drain asked for the write lock while
+    // still holding its read lock, and waited forever. Reads only, so nothing but the early drain
+    // empties the overflow.
+    #[tokio::test]
+    async fn read_only_promotions_drain_early() {
+        let s = shard();
+        for k in 0..CAP as u64 {
+            s.cache.insert(k, k).await;
+        }
+
+        tokio::time::timeout(TIMEOUT, async {
+            for i in 0..10 * (QUEUE + DRAIN_AT) {
+                assert_eq!(s.cache.get(&0).await, Some(0));
+                let overflow = promotion_overflow_len(&s.cache).await;
+                assert!(
+                    overflow < DRAIN_AT,
+                    "read {i}: overflow holds {overflow} promotions, never drained at {DRAIN_AT}"
+                );
+            }
+        })
+        .await
+        .expect("early drain deadlocked");
+
+        // Key 0 was inserted first, so it was least recently used until its promotions were
+        // applied. The next eviction must take key 1 instead.
+        s.cache.insert(100, 100).await;
+        assert_eq!(s.cache.get(&0).await, Some(0));
+        assert_eq!(s.cache.get(&1).await, None);
+    }
+
+    // Expired entries found by reads are queued for eviction. With no writes, only the early drain
+    // can remove them.
+    #[tokio::test]
+    async fn read_only_expirations_drain_early() {
+        let s = shard();
+        for k in 0..CAP as u64 {
+            s.cache
+                .insert_with_ttl(k, k, Duration::from_millis(1))
+                .await;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Fill the eviction queue, then the overflow up to the drain point.
+        tokio::time::timeout(TIMEOUT, async {
+            for _ in 0..QUEUE + DRAIN_AT {
+                assert_eq!(s.cache.get(&0).await, None);
+            }
+        })
+        .await
+        .expect("early drain deadlocked");
+
+        assert_eq!(
+            s.cache.len().await,
+            CAP - 1,
+            "the expired key was not evicted by an early drain"
+        );
+    }
+
+    // Many readers overflow the same queue at once. Only the reader that reaches each drain point
+    // takes the write lock; nothing may hang, and once every read has returned the overflow is
+    // below the drain point.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_readers_drain_early() {
+        let s = Arc::new(shard());
+        for k in 0..CAP as u64 {
+            s.cache.insert(k, k).await;
+        }
+
+        let readers: Vec<_> = (0..8)
+            .map(|t| {
+                let s = Arc::clone(&s);
+                tokio::spawn(async move {
+                    for i in 0..READS_PER_TASK {
+                        let k = (t + i) % CAP as u64;
+                        assert_eq!(s.cache.get(&k).await, Some(k));
+                    }
+                })
+            })
+            .collect();
+
+        tokio::time::timeout(TIMEOUT, async {
+            for reader in readers {
+                reader.await.unwrap();
+            }
+        })
+        .await
+        .expect("early drain deadlocked");
+
+        let overflow = promotion_overflow_len(&s.cache).await;
+        assert!(
+            overflow < DRAIN_AT,
+            "overflow holds {overflow} promotions after all reads returned"
+        );
     }
 }

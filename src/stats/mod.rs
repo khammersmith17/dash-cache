@@ -1,5 +1,7 @@
-use std::cell::Cell;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    cell::Cell,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 mod private {
     pub trait Sealed {}

@@ -1,6 +1,7 @@
-use std::sync::OnceLock;
-use std::time::Duration;
-use std::time::Instant;
+use std::{
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
 
 static CACHE_START: OnceLock<Instant> = OnceLock::new();
 

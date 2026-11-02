@@ -141,8 +141,7 @@ mod builder_tests {
 #[cfg(test)]
 mod dash_cache_tests {
     use super::*;
-    use std::num::NonZeroUsize;
-    use std::time::Duration;
+    use std::{num::NonZeroUsize, time::Duration};
 
     // Fixed shard count and capacity for deterministic tests — avoids CPU-count variance.
     fn make_cache(shard_cap: usize) -> DashCache<u64, u64> {

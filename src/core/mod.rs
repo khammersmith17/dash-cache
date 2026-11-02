@@ -1,14 +1,17 @@
-use crate::backend::SlabBackend;
-use crate::entry::CacheEntry;
-use crate::slabvec::SlabVec;
-use crate::stats::{CacheStats, LocalStats, Stats};
-use crate::util;
-use std::collections::HashMap;
-use std::collections::hash_map::Entry;
-use std::hash::{BuildHasher, Hash};
-use std::marker::PhantomData;
-use std::num::NonZeroUsize;
-use std::time::Duration;
+use crate::{
+    backend::{SlabBackend, SlabClear},
+    entry::CacheEntry,
+    slabvec::SlabVec,
+    stats::{CacheStats, LocalStats, Stats},
+    util,
+};
+use std::{
+    collections::hash_map::{Entry, HashMap},
+    hash::{BuildHasher, Hash},
+    marker::PhantomData,
+    num::NonZeroUsize,
+    time::Duration,
+};
 use thiserror::Error;
 
 /// Covers the three cases for a get operation that is queued in [crate::dash_cache::DashCache].
@@ -236,27 +239,13 @@ where
         self.slab.len()
     }
 
-    /// Promote an entry to head.
-    pub(crate) fn promote(&mut self, entry_idx: u32) {
-        debug_assert!(self.head.is_some());
-        let head_idx = self.head.unwrap();
-        if head_idx != entry_idx {
-            self.unlink_node(entry_idx);
-            self.push_node_to_head(entry_idx);
-        }
-    }
-
     // Promotes the entry at `entry_idx` to the head of the recency list and overwrites its value.
     // Safety: `entry_idx` must be a valid index into `self.slab`, obtained from `node_map`.
     // The cache must be non-empty when this is called (debug-asserted).
     #[inline(always)]
     fn update_cache_entry(&mut self, entry_idx: u32, value: V, expires: u64) {
         debug_assert!(self.head.is_some());
-        let head_idx = self.head.unwrap();
-        if head_idx != entry_idx {
-            self.unlink_node(entry_idx);
-            self.push_node_to_head(entry_idx);
-        }
+        self.promote_existing_entry(entry_idx);
 
         let entry = self.slab.get_entry_mut(entry_idx as usize);
         entry.value = value;
@@ -265,8 +254,8 @@ where
 
     /// Updates the value for an existing key and promotes it to most recently used.
     ///
-    /// Returns `Err(CacheError::KeyNotExist)` if the key is not in the cache. Use `insert` to
-    /// write a new key. There is no `get_mut` — this is the correct method for mutating a stored
+    /// Returns `Err(CacheError::KeyNotExist)` if the key is not in the cache or has expired. Use
+    /// `insert` to write a new key. There is no `get_mut` — this is the correct method for mutating a stored
     /// value.
     pub fn update<Q>(&mut self, key: &Q, value: V) -> Result<(), CacheError>
     where
@@ -294,6 +283,11 @@ where
         let Some(entry_idx) = self.node_map.get(key) else {
             return Err(CacheError::KeyNotExist);
         };
+
+        if !self.slab.get_entry(*entry_idx as usize).is_live() {
+            return Err(CacheError::KeyNotExist);
+        }
+
         self.stats.hit();
         self.update_cache_entry(*entry_idx, value, util::expires_from_ttl(ttl));
 
@@ -303,8 +297,8 @@ where
     /// Updates the value for an existing key along with the item's ttl and promotes it to
     /// most recently used.
     ///
-    /// Returns `Err(CacheError::KeyNotExist)` if the key is not in the cache. Use `insert` to
-    /// write a new key. There is no `get_mut` — this is the correct method for mutating a stored
+    /// Returns `Err(CacheError::KeyNotExist)` if the key is not in the cache or has expired. Use
+    /// `insert` to write a new key. There is no `get_mut` — this is the correct method for mutating a stored
     /// value.
     pub fn update_with_ttl<Q>(&mut self, key: &Q, value: V, ttl: Duration) -> Result<(), CacheError>
     where
@@ -342,7 +336,8 @@ where
         K: std::borrow::Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let entry_idx = self.node_map.remove(key)?;
+        // Wait to drop key, possibly a user defined function.
+        let (_key, entry_idx) = self.node_map.remove_entry(key)?;
         Some(self.evict_entry(entry_idx))
     }
 
@@ -360,11 +355,9 @@ where
         let len = self.len();
         if len > 1 && entry_idx as usize != len - 1 {
             let entry = self.slab.get_entry(len - 1);
-            let swap_key = entry.key.clone();
             let swap_prev = entry.prev();
             let swap_next = entry.next();
-
-            *self.node_map.get_mut(&swap_key).unwrap() = entry_idx;
+            *self.node_map.get_mut(&entry.key).unwrap() = entry_idx;
 
             if let Some(swap_prev) = swap_prev {
                 debug_assert!((swap_prev as usize) < self.slab.len());
@@ -396,8 +389,10 @@ where
     }
 
     pub(crate) fn evict_from_idx(&mut self, entry_idx: u32) {
-        let key = self.slab.get_entry(entry_idx as usize).key.clone();
-        let _ = self.node_map.remove(&key);
+        let entry = &self.slab.get_entry(entry_idx as usize);
+
+        // Wait to drop key, possibly a user defined function.
+        let (_key, entry_idx) = self.node_map.remove_entry(&entry.key).unwrap();
         let _ = self.evict_entry(entry_idx);
     }
 
@@ -410,7 +405,7 @@ where
     /// Returns `true` if the cache is at capacity. The next insert of a new key will evict the
     /// least recently used entry.
     pub fn is_full(&self) -> bool {
-        self.node_map.len() == self.cap
+        self.slab.len() == self.cap
     }
 
     /// Insert a new item into the cache with a non default TTL. If the item already exists, then
@@ -433,6 +428,9 @@ where
     }
 
     fn insert_entry(&mut self, key: K, value: V, expires: u64) {
+        // Container to store user fields, so they are not dropped until the end of the cache state
+        // update. Drop may be user defined and may panic.
+        let mut _evicted: Option<(K, K, V)> = None;
         let idx = if self.is_full() {
             match self.node_map.get(&key) {
                 Some(entry_idx) => {
@@ -440,15 +438,22 @@ where
                     return;
                 }
                 None => {
-                    let stale_idx = self.pop_tail();
+                    // Call user defined Clone implementation before an entering any unsafe
+                    // sections.
+                    let new_key = key.clone();
+                    let (stale_map_key, stale_idx) = self.pop_tail();
+
                     debug_assert!((stale_idx as usize) < self.slab.len());
-                    {
-                        let stale_entry = self.slab.get_entry_mut(stale_idx as usize);
-                        stale_entry.key = key.clone();
-                        stale_entry.value = value;
-                        stale_entry.clear_neighbors();
-                        stale_entry.expires = expires;
-                    }
+                    let stale_entry = self.slab.get_entry_mut(stale_idx as usize);
+
+                    let stale_slab_key = std::mem::replace(&mut stale_entry.key, new_key);
+                    let stale_value = std::mem::replace(&mut stale_entry.value, value);
+                    let _ = std::mem::replace(&mut stale_entry.expires, expires);
+
+                    // Watit until cache state is consistent to call user defined drop
+                    // implementation. Both copies of the key (map and slab) are held.
+                    _evicted = Some((stale_map_key, stale_slab_key, stale_value));
+                    stale_entry.clear_neighbors();
                     self.node_map.insert(key, stale_idx);
                     stale_idx
                 }
@@ -478,8 +483,11 @@ where
     pub fn drain(&mut self) {
         self.head = None;
         self.tail = None;
+
+        // Registr clear handle before.
+        // When `clear` is called on the map, a user defined Drop function may panic.
+        let _handle = SlabClear::new(&mut self.slab);
         self.node_map.clear();
-        self.slab.clear();
     }
 
     #[inline(always)]
@@ -542,29 +550,35 @@ where
                     || (self.head.is_none() && self.tail.is_none())
             );
             debug_assert!((entry_idx as usize) < self.slab.len());
+
             let node = self.slab.get_entry_mut(entry_idx as usize);
             let (prev, next) = (node.prev(), node.next());
             debug_assert!(prev.is_none() && next.is_none());
         }
 
-        if let Some(head_idx) = self.head {
-            {
-                let node = self.slab.get_entry_mut(entry_idx as usize);
-                node.set_next(Some(head_idx));
-                node.set_prev(None);
+        match self.head {
+            Some(head_idx) if head_idx != entry_idx => {
+                {
+                    let node = self.slab.get_entry_mut(entry_idx as usize);
+                    node.set_next(Some(head_idx));
+                    node.set_prev(None);
+                }
+                self.slab
+                    .get_entry_mut(head_idx as usize)
+                    .set_prev(Some(entry_idx));
+                self.head = Some(entry_idx);
             }
-            self.slab
-                .get_entry_mut(head_idx as usize)
-                .set_prev(Some(entry_idx));
-            self.head = Some(entry_idx);
-        } else {
-            self.head = Some(entry_idx);
-            self.tail = Some(entry_idx);
+            None => {
+                self.head = Some(entry_idx);
+                self.tail = Some(entry_idx);
+            }
+            // Node is already head.
+            _ => {}
         }
     }
 
     #[inline(always)]
-    fn pop_tail(&mut self) -> u32 {
+    fn pop_tail(&mut self) -> (K, u32) {
         #[cfg(debug_assertions)]
         {
             debug_assert!(
@@ -576,11 +590,14 @@ where
         }
 
         let tail_idx = self.tail.unwrap();
-        self.unlink_node(tail_idx);
         self.stats.eviction();
 
-        let key = self.slab.get_entry(tail_idx as usize).key.clone();
-        self.node_map.remove(&key).unwrap()
+        let tail_entry = self.slab.get_entry(tail_idx as usize);
+
+        // Wait to drop key, possibly a user defined function.
+        let (key, entry_idx) = self.node_map.remove_entry(&tail_entry.key).unwrap();
+        self.unlink_node(tail_idx);
+        (key, entry_idx)
     }
 
     /// Returns a clone of the value for the given key and promotes it to most recently used.
@@ -626,6 +643,18 @@ where
         GetResult::Hit(value, entry_idx)
     }
 
+    // Only should be called when promoting an entry on get
+    #[inline]
+    pub(crate) fn promote_existing_entry(&mut self, entry_idx: u32) {
+        debug_assert!(self.head.is_some());
+        let head_idx = self.head.unwrap();
+
+        if head_idx != entry_idx {
+            self.unlink_node(entry_idx);
+            self.push_node_to_head(entry_idx);
+        }
+    }
+
     fn get_and_promote(&mut self, entry_idx: u32) -> Option<V> {
         if !self.is_entry_valid(entry_idx) {
             self.stats.expiration();
@@ -635,12 +664,7 @@ where
 
         self.stats.hit();
 
-        let head_idx = self.head.unwrap();
-        if head_idx != entry_idx {
-            self.unlink_node(entry_idx);
-            self.push_node_to_head(entry_idx);
-        }
-
+        self.promote_existing_entry(entry_idx);
         let value = self.slab.get_entry(entry_idx as usize).value.clone();
         Some(value)
     }
