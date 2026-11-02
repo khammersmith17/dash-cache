@@ -73,9 +73,16 @@ where
     /// In all other cases, only one caller will attempt the lock upgrade.
     fn should_drain_early(&self, handle_size: usize, capacity: usize) -> bool {
         let drain_factor = capacity * (FORCED_DRAIN_MULTIPLE - 1);
+        // If the queue is at capacity, and a multiple of the capacity.
+        // In this case, only one held read lock attempts to acquire the write lock.
+        // If the task is canceled, then the next caller at multiple of `drain_factor`
+        // will perform the drain.
         (handle_size >= drain_factor) && handle_size.is_multiple_of(drain_factor)
     }
 
+    /// Queue an entries promotion. If the concurrent queue is full, write to the overflow queue.
+    /// The overflow queue is only allocated capacity when it is needed.
+    /// Returns to the caller if an early drain should occur.
     #[must_use]
     fn queue_promotion(&self, entry_idx: u32) -> bool {
         if self.promotion.try_push(entry_idx).is_err() {
@@ -91,6 +98,9 @@ where
         false
     }
 
+    /// Queue an entries eviction. If the concurrent queue is full, write to the overflow queue.
+    /// The overflow queue is only allocated capacity when it is needed.
+    /// Returns to the caller if an early drain should occur.
     #[must_use]
     fn queue_eviction(&self, entry_idx: u32) -> bool {
         if self.eviction.try_push(entry_idx).is_err() {
@@ -108,6 +118,7 @@ where
     }
 
     fn drain_queues(&mut self) {
+        // Replace with an empty Vec so space is only allocated when it is needed.
         let promotion_overflow = std::mem::take(self.promotion_overflow.get_mut().unwrap());
         let eviction_overflow = std::mem::take(self.eviction_overflow.get_mut().unwrap());
 
@@ -336,6 +347,8 @@ where
         }
     }
 
+    // When the queue has reached overflow capacity, perform all the queued actions on a read
+    // action.
     async fn early_drain(&self) {
         let mut guard = self.handle.write().await;
         guard.drain_queues();
